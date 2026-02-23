@@ -1,5 +1,7 @@
 #!/bin/sh
 
+# File location /usr/bin/authentication_list.sh
+
 # --- Configuration ---
 GATEWAY="bhscyber"
 BASE_URL="https://mpesa-wifi-portal.prodigy4614.workers.dev"
