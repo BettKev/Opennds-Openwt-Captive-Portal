@@ -1,0 +1,37 @@
+{
+  "name": "mpesa-wifi-portal",
+  "main": "src/worker.js",
+  "workers_dev": true,
+  "preview_urls": false,
+  "compatibility_date": "2026-01-07",
+  "observability": {
+    "enabled": true,
+    "head_sampling_rate": 1,
+    "logs": {
+      "enabled": true,
+      "head_sampling_rate": 1,
+      "persist": true,
+      "invocation_logs": true
+    },
+    "traces": {
+      "enabled": false,
+      "persist": true,
+      "head_sampling_rate": 1
+    }
+  },
+  "d1_databases": [
+    {
+      "binding": "DB",
+      "database_id": "f636423a-58ef-437a-96fd-f44890cdf749"
+    }
+  ],
+  "vars": {
+    "FAS_KEY": "secret123",
+    "MPESA_CALLBACK_URL": "https://mpesa-wifi-portal.prodigy4614.workers.dev/callback",
+    "MPESA_CONSUMER_KEY": "8KOLSBQeytfjeKr6M3VP20GfuSdbrgpo4YJTZwuLoKluC7j7",
+    "MPESA_CONSUMER_SECRET": "EOJsVwzKGG2grKKlvkTKmHkE1TaAbtmixUfPQQQr2WCn4uXbyzGqAxuexe8JbzAT",
+    "MPESA_PASSKEY": "ecb99409c33282a8882fcabbb8996ef3f956b28a2b167f02d8a39feef32db1ac",
+    "MPESA_SHORTCODE": "5666216",
+    "MPESA_TILL_NUMBER": "3577224"
+  }
+}
