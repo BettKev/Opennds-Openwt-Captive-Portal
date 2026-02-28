@@ -47,6 +47,38 @@ export default {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
+    // // --- 1. AUTHMON POLLING ---
+    // const authGet = url.searchParams.get("auth_get");
+    // if (authGet !== null) {
+    //   const payload = url.searchParams.get("payload") || "";
+    //   const isRecovery = url.searchParams.get("recovery") === "true"; 
+    //   const gateway = url.searchParams.get("gateway") || "bhscyber"; 
+
+    //   if (payload.startsWith("*") && payload.length > 1) {
+    //     const tokensToAck = payload.replace(/\*/g, "").trim().split(/\s+/).filter(t => t.length > 0);
+    //     if (tokensToAck.length > 0) {
+    //       for (const token of tokensToAck) {
+    //         await env.DB.prepare(`UPDATE payments SET processed = 1 WHERE rhid = ? AND status = 'PAID'`).bind(token).run();
+    //       }
+    //     }
+    //     return new Response("ACK_OK\n", { headers: { "Content-Type": "text/plain" } });
+    //   }
+
+    //   const query = isRecovery 
+    //     ? `SELECT rhid, duration_minutes, mac_address FROM payments 
+    //        WHERE status = 'PAID' AND duration_minutes > 0 AND gateway_hash = ? AND rhid IS NOT NULL`
+    //     : `SELECT rhid, duration_minutes, mac_address FROM payments 
+    //        WHERE status = 'PAID' AND processed = 0 AND duration_minutes > 0 AND gateway_hash = ? AND rhid IS NOT NULL`;
+
+    //   const { results } = await env.DB.prepare(query).bind(gateway).all();
+
+    //   if (results && results.length > 0) {
+    //     const authList = results.map((r) => `* ${r.rhid} ${r.duration_minutes} 0 0 0 0 ${r.mac_address}`).join("\n");
+    //     return new Response(authList + "\n", { headers: { "Content-Type": "text/plain" } });
+    //   }
+    //   return new Response("*\n", { headers: { "Content-Type": "text/plain" } });
+    // }
+
     // --- 1. AUTHMON POLLING ---
     const authGet = url.searchParams.get("auth_get");
     if (authGet !== null) {
@@ -64,16 +96,27 @@ export default {
         return new Response("ACK_OK\n", { headers: { "Content-Type": "text/plain" } });
       }
 
+      // Logic: Join payments (p) with packages (pkg) using the amount as the link
       const query = isRecovery 
-        ? `SELECT rhid, duration_minutes, mac_address FROM payments 
-           WHERE status = 'PAID' AND duration_minutes > 0 AND gateway_hash = ? AND rhid IS NOT NULL`
-        : `SELECT rhid, duration_minutes, mac_address FROM payments 
-           WHERE status = 'PAID' AND processed = 0 AND duration_minutes > 0 AND gateway_hash = ? AND rhid IS NOT NULL`;
+        ? `SELECT p.rhid, p.duration_minutes, p.mac_address, pkg.upload_rate, pkg.download_rate 
+           FROM payments p
+           LEFT JOIN packages pkg ON p.amount = pkg.amount
+           WHERE p.status = 'PAID' AND p.duration_minutes > 0 AND p.gateway_hash = ? AND p.rhid IS NOT NULL`
+        : `SELECT p.rhid, p.duration_minutes, p.mac_address, pkg.upload_rate, pkg.download_rate 
+           FROM payments p
+           LEFT JOIN packages pkg ON p.amount = pkg.amount
+           WHERE p.status = 'PAID' AND p.processed = 0 AND p.duration_minutes > 0 AND p.gateway_hash = ? AND p.rhid IS NOT NULL`;
 
       const { results } = await env.DB.prepare(query).bind(gateway).all();
 
       if (results && results.length > 0) {
-        const authList = results.map((r) => `* ${r.rhid} ${r.duration_minutes} 0 0 0 0 ${r.mac_address}`).join("\n");
+        // format: * [rhid] [minutes] [up_kbps] [down_kbps] [up_quota] [down_quota] [mac]
+        const authList = results.map((r) => {
+          const up = r.upload_rate || 0;
+          const down = r.download_rate || 0;
+          return `* ${r.rhid} ${r.duration_minutes} ${up} ${down} 0 0 ${r.mac_address}`;
+        }).join("\n");
+        
         return new Response(authList + "\n", { headers: { "Content-Type": "text/plain" } });
       }
       return new Response("*\n", { headers: { "Content-Type": "text/plain" } });
@@ -212,14 +255,141 @@ export default {
   }
 };
 
-// --- HTML GENERATORS ---
+// // --- HTML GENERATORS ---
+// function generateLoginHTML(mac, pkgs) {
+//   const pkgElements = pkgs.map((p, idx) => `
+//     <div class="pkg ${idx === 0 ? 'selected' : ''}" id="pkg-${p.id}" onclick="sel('${p.id}')">
+//       <div class="pkg-name">${p.name}</div>
+//       <div class="pkg-price">${p.amount}</div>
+//     </div>
+//   `).join('');
+
+//   const firstPkgId = pkgs.length > 0 ? pkgs[0].id : '';
+
+//   return `<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+//   <style>
+//     :root { --glass: rgba(10, 10, 10, 0.92); --border: rgba(255, 255, 255, 0.18); --accent: #2ecc71; }
+    
+//     body { 
+//       font-family: 'Inter', -apple-system, system-ui, sans-serif; 
+//       margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
+//       background: linear-gradient(-45deg, #ee7752, #e73c7e, #23a6d5, #23d5ab, #9b59b6, #f1c40f);
+//       background-size: 600% 600%;
+//       animation: rainbowBG 18s ease infinite;
+//       color: #fff; padding: 10px; box-sizing: border-box;
+//       overflow: hidden;
+//     }
+
+//     @keyframes rainbowBG {
+//       0% { background-position: 0% 50%; }
+//       50% { background-position: 100% 50%; }
+//       100% { background-position: 0% 50%; }
+//     }
+
+//     .card { 
+//       background: var(--glass); padding: 22px; border-radius: 30px; backdrop-filter: blur(30px); -webkit-backdrop-filter: blur(30px); 
+//       border: 1px solid var(--border); max-width: 400px; width: 100%; box-shadow: 0 25px 50px rgba(0,0,0,0.6);
+//     }
+
+//     h2 { font-weight: 900; margin: 0; font-size: 26px; color: #fff; letter-spacing: -1px; text-align: center; }
+//     .sub-head { color: var(--accent); font-size: 11px; margin-bottom: 20px; text-transform: uppercase; letter-spacing: 3px; font-weight: 800; text-align: center; }
+    
+//     .section-label { 
+//       text-align: left; font-size: 10px; font-weight: 900; color: rgba(255,255,255,0.6); 
+//       margin: 0 0 8px 5px; text-transform: uppercase; display: flex; align-items: center;
+//     }
+//     .section-label::before {
+//       content: ''; display: inline-block; width: 6px; height: 6px; background: var(--accent); margin-right: 8px; border-radius: 50%;
+//     }
+
+//     .pkg-grid { 
+//       display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 20px; 
+//     }
+    
+//     .pkg { 
+//       background: rgba(255,255,255,0.06); border: 1px solid var(--border); 
+//       padding: 12px 5px; border-radius: 14px; cursor: pointer; transition: 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+//       display: flex; flex-direction: column; align-items: center; justify-content: center;
+//     }
+//     .pkg.selected { border: 2.5px solid var(--accent); background: rgba(46, 204, 113, 0.2); transform: translateY(-3px); box-shadow: 0 10px 20px rgba(0,0,0,0.3); }
+//     .pkg-name { font-size: 10px; opacity: 0.9; margin-bottom: 2px; font-weight: 700; text-transform: uppercase; }
+//     .pkg-price { font-size: 18px; font-weight: 900; }
+//     .pkg-price::after { content: "/-"; font-size: 12px; margin-left: 1px; opacity: 0.6; }
+
+//     .input-container { background: rgba(255,255,255,0.04); border-radius: 16px; padding: 12px; border: 1px solid var(--border); margin-bottom: 15px; }
+//     input { 
+//       width: 100%; padding: 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1); 
+//       background: #000; color: #fff; font-size: 20px; font-weight: 800; 
+//       box-sizing: border-box; text-align: center; outline: none; transition: 0.3s;
+//     }
+//     input:focus { border-color: var(--accent); box-shadow: 0 0 15px rgba(46, 204, 113, 0.3); }
+
+//     .btn { 
+//       background: var(--accent); color: #000; border: none; padding: 16px; width: 100%; 
+//       border-radius: 16px; font-weight: 900; cursor: pointer; font-size: 15px; 
+//       text-transform: uppercase; letter-spacing: 1px; transition: 0.3s;
+//     }
+//     .btn:active { transform: scale(0.97); }
+
+//     .ad-box { margin-top: 15px; font-size: 11px; padding-top: 12px; border-top: 1px solid var(--border); color: rgba(255,255,255,0.5); line-height: 1.4; text-align: center; }
+//   </style></head>
+//   <body>
+//     <div class="card">
+//       <h2>BHS WIFI</h2>
+//       <div class="sub-head">Ultra High Speed</div>
+//       <div class="section-label">1. Select Plan</div>
+//       <div class="pkg-grid">${pkgElements}</div>
+//       <div class="section-label">2. M-Pesa Number</div>
+//       <div class="input-container">
+//         <input type="tel" id="phone" placeholder="0712 345 678" maxlength="12">
+//       </div>
+//       <button class="btn" id="payBtn" onclick="pay()">Secure Connect</button>
+//       <div class="ad-box">
+//         <strong>BHS CYBER SERVICES</strong><br>KRA, e-Citizen & Printing.
+//       </div>
+//     </div>
+//     <script>
+//       let selectedPkgId = '${firstPkgId}';
+//       function sel(id) { 
+//         selectedPkgId = id; 
+//         document.querySelectorAll('.pkg').forEach(e=>e.classList.remove('selected')); 
+//         document.getElementById('pkg-'+id).classList.add('selected'); 
+//       }
+//       async function pay() {
+//         // Unlock audio context/speech for later use on this gesture
+//         if (window.speechSynthesis) {
+//            const initial = new SpeechSynthesisUtterance("");
+//            window.speechSynthesis.speak(initial);
+//         }
+
+//         const ph = document.getElementById('phone').value.trim();
+//         if(ph.length < 10) return alert('Invalid phone number');
+//         const btn = document.getElementById('payBtn');
+//         btn.disabled = true; btn.innerText = "Processing...";
+//         try {
+//           const r = await fetch('/initiate-stk?phone='+encodeURIComponent(ph)+'&mac=${mac}&pkg='+selectedPkgId);
+//           const d = await r.json();
+//           if(d.success) window.location.href = '/waiting?id=' + d.checkout_id;
+//           else { alert('Error: ' + d.error); btn.disabled = false; btn.innerText = "Secure Connect"; }
+//         } catch(e) { alert('Network error.'); btn.disabled = false; btn.innerText = "Secure Connect"; }
+//       }
+//     </script>
+//   </body></html>`;
+// }
+
 function generateLoginHTML(mac, pkgs) {
-  const pkgElements = pkgs.map((p, idx) => `
-    <div class="pkg ${idx === 0 ? 'selected' : ''}" id="pkg-${p.id}" onclick="sel('${p.id}')">
-      <div class="pkg-name">${p.name}</div>
-      <div class="pkg-price">${p.amount}</div>
-    </div>
-  `).join('');
+  const pkgElements = pkgs.map((p, idx) => {
+    // Convert kbps to Mbps for display (e.g., 5000 -> 5)
+    const speedMbps = p.download_rate ? (p.download_rate / 1000).toFixed(0) : 'Max';
+    
+    return `
+      <div class="pkg ${idx === 0 ? 'selected' : ''}" id="pkg-${p.id}" onclick="sel('${p.id}')">
+        <div class="pkg-name">${p.name}</div>
+        <div class="pkg-price">${p.amount}</div>
+        <div class="pkg-speed">${speedMbps} Mbps</div>
+      </div>
+    `;
+  }).join('');
 
   const firstPkgId = pkgs.length > 0 ? pkgs[0].id : '';
 
@@ -267,11 +437,24 @@ function generateLoginHTML(mac, pkgs) {
       background: rgba(255,255,255,0.06); border: 1px solid var(--border); 
       padding: 12px 5px; border-radius: 14px; cursor: pointer; transition: 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
       display: flex; flex-direction: column; align-items: center; justify-content: center;
+      position: relative;
     }
     .pkg.selected { border: 2.5px solid var(--accent); background: rgba(46, 204, 113, 0.2); transform: translateY(-3px); box-shadow: 0 10px 20px rgba(0,0,0,0.3); }
     .pkg-name { font-size: 10px; opacity: 0.9; margin-bottom: 2px; font-weight: 700; text-transform: uppercase; }
     .pkg-price { font-size: 18px; font-weight: 900; }
     .pkg-price::after { content: "/-"; font-size: 12px; margin-left: 1px; opacity: 0.6; }
+    
+    /* New Speed Badge Style */
+    .pkg-speed { 
+      font-size: 9px; 
+      background: var(--accent); 
+      color: #000; 
+      padding: 2px 6px; 
+      border-radius: 8px; 
+      margin-top: 4px; 
+      font-weight: 800; 
+      text-transform: uppercase;
+    }
 
     .input-container { background: rgba(255,255,255,0.04); border-radius: 16px; padding: 12px; border: 1px solid var(--border); margin-bottom: 15px; }
     input { 
@@ -313,7 +496,6 @@ function generateLoginHTML(mac, pkgs) {
         document.getElementById('pkg-'+id).classList.add('selected'); 
       }
       async function pay() {
-        // Unlock audio context/speech for later use on this gesture
         if (window.speechSynthesis) {
            const initial = new SpeechSynthesisUtterance("");
            window.speechSynthesis.speak(initial);
