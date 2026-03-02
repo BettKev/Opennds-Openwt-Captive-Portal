@@ -120,40 +120,118 @@ async function getDashboardData(env, page = 1, statusFilter = 'all', deviceFilte
   const earnings = await env.DB.prepare(`
     SELECT 
       SUM(CASE WHEN created_at >= date('now') THEN amount ELSE 0 END) as daily,
+      SUM(CASE WHEN created_at >= date('now', '-1 day') AND created_at < date('now') THEN amount ELSE 0 END) as prev_daily,
       SUM(CASE WHEN created_at >= date('now', '-7 days') THEN amount ELSE 0 END) as weekly,
-      SUM(CASE WHEN created_at >= date('now', '-30 days') THEN amount ELSE 0 END) as monthly
+      SUM(CASE WHEN created_at >= date('now', '-14 days') AND created_at < date('now', '-7 days') THEN amount ELSE 0 END) as prev_weekly,
+      SUM(CASE WHEN created_at >= date('now', '-30 days') THEN amount ELSE 0 END) as monthly,
+      SUM(CASE WHEN created_at >= date('now', '-60 days') AND created_at < date('now', '-30 days') THEN amount ELSE 0 END) as prev_monthly
     FROM payments WHERE UPPER(status) = 'PAID'
   `).first();
 
   // --- CHART LOGIC: MULTI-SCALE TRENDS ---
-  const dailyQuery = await env.DB.prepare(`
-    WITH DailyMinuteTotals AS (
+  // Revised Daily Query for SQLite consistency
+  const dailyData = await env.DB.prepare(`
+    WITH RECURSIVE hours(h) AS (
+      SELECT 0 UNION ALL SELECT h + 1 FROM hours WHERE h < 23
+    ),
+    TimeSlots AS (
+      SELECT printf('%02d:00', h) as time FROM hours
+    ),
+    CurrentDay AS (
       SELECT strftime('%H:00', created_at) as time, SUM(amount) as subtotal
       FROM payments WHERE UPPER(status) = 'PAID' AND created_at >= date('now') GROUP BY time
+    ),
+    PrevDay AS (
+      SELECT strftime('%H:00', created_at) as time, SUM(amount) as subtotal
+      FROM payments WHERE UPPER(status) = 'PAID' AND created_at >= date('now', '-1 day') AND created_at < date('now') GROUP BY time
     )
-    SELECT time, SUM(subtotal) OVER (ORDER BY time ASC) as total FROM DailyMinuteTotals ORDER BY time ASC
+    SELECT ts.time, 
+           COALESCE(cd.subtotal, 0) as current_sub,
+           COALESCE(pd.subtotal, 0) as prev_sub
+    FROM TimeSlots ts
+    LEFT JOIN CurrentDay cd ON ts.time = cd.time
+    LEFT JOIN PrevDay pd ON ts.time = pd.time
+    ORDER BY ts.time ASC
   `).all();
 
-  const weeklyQuery = await env.DB.prepare(`
-    WITH WeeklyTotals AS (
-      SELECT date(created_at) as time, SUM(amount) as subtotal
-      FROM payments WHERE UPPER(status) = 'PAID' AND created_at >= date('now', '-7 days') GROUP BY time
+  const weeklyData = await env.DB.prepare(`
+    WITH RECURSIVE days(n) AS (
+      SELECT 0 UNION ALL SELECT n + 1 FROM days WHERE n < 6
+    ),
+    CurrentWeekSlots AS (
+      SELECT date('now', '-' || n || ' days') as day FROM days
+    ),
+    PrevWeekSlots AS (
+      SELECT date('now', '-' || (n + 7) || ' days') as day FROM days
+    ),
+    Stats AS (
+      SELECT date(created_at) as day, SUM(amount) as subtotal
+      FROM payments WHERE UPPER(status) = 'PAID' AND created_at >= date('now', '-14 days') GROUP BY day
     )
-    SELECT time, SUM(subtotal) OVER (ORDER BY time ASC) as total FROM WeeklyTotals ORDER BY time ASC
+    SELECT cw.day, 
+           COALESCE(s_curr.subtotal, 0) as current_sub,
+           COALESCE(s_prev.subtotal, 0) as prev_sub
+    FROM CurrentWeekSlots cw
+    LEFT JOIN Stats s_curr ON cw.day = s_curr.day
+    LEFT JOIN PrevWeekSlots pw ON date(cw.day, '-7 days') = pw.day
+    LEFT JOIN Stats s_prev ON pw.day = s_prev.day
+    ORDER BY cw.day ASC
   `).all();
 
-  const monthlyQuery = await env.DB.prepare(`
-    WITH MonthlyTotals AS (
-      SELECT date(created_at) as time, SUM(amount) as subtotal
-      FROM payments WHERE UPPER(status) = 'PAID' AND created_at >= date('now', '-30 days') GROUP BY time
+  const monthlyData = await env.DB.prepare(`
+    WITH RECURSIVE days(n) AS (
+      SELECT 0 UNION ALL SELECT n + 1 FROM days WHERE n < 29
+    ),
+    CurrentMonthSlots AS (
+      SELECT date('now', '-' || n || ' days') as day FROM days
+    ),
+    PrevMonthSlots AS (
+      SELECT date('now', '-' || (n + 30) || ' days') as day FROM days
+    ),
+    Stats AS (
+      SELECT date(created_at) as day, SUM(amount) as subtotal
+      FROM payments WHERE UPPER(status) = 'PAID' AND created_at >= date('now', '-60 days') GROUP BY day
     )
-    SELECT time, SUM(subtotal) OVER (ORDER BY time ASC) as total FROM MonthlyTotals ORDER BY time ASC
+    SELECT cm.day, 
+           COALESCE(s_curr.subtotal, 0) as current_sub,
+           COALESCE(s_prev.subtotal, 0) as prev_sub
+    FROM CurrentMonthSlots cm
+    LEFT JOIN Stats s_curr ON cm.day = s_curr.day
+    LEFT JOIN PrevMonthSlots pm ON date(cm.day, '-30 days') = pm.day
+    LEFT JOIN Stats s_prev ON pm.day = s_prev.day
+    ORDER BY cm.day ASC
   `).all();
+
+  // Process data for cumulative totals
+  const processCumulative = (results) => {
+    let currTotal = 0, prevTotal = 0;
+    return results.map(r => {
+      currTotal += r.current_sub;
+      prevTotal += r.prev_sub;
+      return { time: r.time || r.day, total: currTotal, prev_total: prevTotal };
+    });
+  };
+
+  const finalDaily = processCumulative(dailyData.results);
+  const finalWeekly = processCumulative(weeklyData.results);
+  const finalMonthly = processCumulative(monthlyData.results);
 
   // --- MINUTE USAGE CHART LOGIC ---
   const minuteTrend = await env.DB.prepare(`
-    SELECT strftime('%H:00', created_at) as time, SUM(duration_minutes) as total_mins
-    FROM payments WHERE UPPER(status) = 'PAID' AND created_at >= date('now') GROUP BY time ORDER BY time ASC
+    WITH RECURSIVE hours(h) AS (
+      SELECT 0 UNION ALL SELECT h + 1 FROM hours WHERE h < 23
+    ),
+    TimeSlots AS (
+      SELECT printf('%02d:00', h) as time FROM hours
+    ),
+    Usage AS (
+      SELECT strftime('%H:00', created_at) as time, SUM(duration_minutes) as total_mins
+      FROM payments WHERE UPPER(status) = 'PAID' AND created_at >= date('now') GROUP BY time
+    )
+    SELECT ts.time, COALESCE(u.total_mins, 0) as total_mins
+    FROM TimeSlots ts
+    LEFT JOIN Usage u ON ts.time = u.time
+    ORDER BY ts.time ASC
   `).all();
 
   let filterSql = "";
@@ -211,11 +289,18 @@ async function getDashboardData(env, page = 1, statusFilter = 'all', deviceFilte
       AND UPPER(p.status) = 'PAID' 
       AND p.duration_minutes > 0 
       AND p.processed = 1`).first()).c,
-    earnings: { daily: earnings?.daily || 0, weekly: earnings?.weekly || 0, monthly: earnings?.monthly || 0 },
+    earnings: { 
+      daily: earnings?.daily || 0, 
+      prev_daily: earnings?.prev_daily || 0,
+      weekly: earnings?.weekly || 0, 
+      prev_weekly: earnings?.prev_weekly || 0,
+      monthly: earnings?.monthly || 0,
+      prev_monthly: earnings?.prev_monthly || 0
+    },
     chartData: {
-      daily: dailyQuery.results,
-      weekly: weeklyQuery.results,
-      monthly: monthlyQuery.results,
+      daily: finalDaily,
+      weekly: finalWeekly,
+      monthly: finalMonthly,
       minuteTrend: minuteTrend.results
     },
     records,
@@ -251,112 +336,155 @@ function generateAdminUI(data, currentStatus, currentDevice, currentMinuteFilter
     </tr>
   `).join('');
 
+  const formatTrend = (curr, prev) => {
+    if (!prev) return `<span style="color:#22c55e">New</span>`;
+    const diff = ((curr - prev) / prev) * 100;
+    const color = diff >= 0 ? '#22c55e' : '#ef4444';
+    const arrow = diff >= 0 ? '↑' : '↓';
+    return `<span style="color:${color}; font-size:0.75rem; font-weight:bold">${arrow} ${Math.abs(diff).toFixed(1)}%</span>`;
+  };
+  
+  const dailyTrend = formatTrend(data.earnings.daily, data.earnings.prev_daily);
+  const weeklyTrend = formatTrend(data.earnings.weekly, data.earnings.prev_weekly);
+  const monthlyTrend = formatTrend(data.earnings.monthly, data.earnings.prev_monthly);
+
   return `
-  <!DOCTYPE html>
-  <html lang="en">
-  <head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>BHS PRO Dashboard</title>
-    <link rel="manifest" href="/manifest.json">
-    <meta name="theme-color" content="#3b82f6">
-    <meta name="apple-mobile-web-app-capable" content="yes">
-    <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
-    <style>
-      :root { --primary: #3b82f6; --bg: #0f172a; --surface: #1e293b; --text: #f8fafc; --border: #334155; }
-      body { background: var(--bg); color: var(--text); font-family: system-ui, sans-serif; margin: 0; }
-      nav { background: #020617; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
-      .container { max-width: 1200px; margin: 1.5rem auto; padding: 0 20px; }
-      .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
-      .stat-card { background: var(--surface); padding: 1.2rem; border-radius: 12px; border: 1px solid var(--border); position: relative; }
-      .filter-bar { display: flex; gap: 12px; margin-bottom: 1.5rem; flex-wrap: wrap; }
-      .search-input { flex-grow: 1; padding: 0.6rem; border-radius: 8px; border: 1px solid var(--border); background: #0f172a; color: white; }
-      table { width: 100%; border-collapse: collapse; background: var(--surface); border-radius: 12px; overflow: hidden; }
-      th { background: #263449; text-align: left; padding: 12px; font-size: 0.75rem; color: #94a3b8; }
-      td { padding: 12px; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
-      .badge { padding: 4px 8px; border-radius: 6px; font-size: 0.7rem; font-weight: bold; }
-      .status-green { background: rgba(34,197,94,0.2); color: #4ade80; }
-      .status-yellow { background: rgba(245,158,11,0.2); color: #fbbf24; }
-      .pulse { width: 8px; height: 8px; background: #4ade80; border-radius: 50%; display: inline-block; margin-right: 8px; animation: pulse 2s infinite; }
-      @keyframes pulse { 0% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(1.2); } 100% { opacity: 1; transform: scale(1); } }
-      .btn { padding: 0.6rem 1rem; border-radius: 8px; border: 1px solid var(--border); background: #334155; color: white; cursor: pointer; }
-      .btn-primary { background: var(--primary); border: none; }
-      #installBtn { display: none; margin-right: 15px; background: #10b981; border: none; font-weight: bold; }
-      .tabs { display: flex; gap: 10px; margin-bottom: 1.5rem; border-bottom: 1px solid var(--border); }
-      .tab-btn { background: none; border: none; color: #94a3b8; padding: 10px 15px; cursor: pointer; font-weight: bold; transition: 0.2s; }
-      .tab-btn.active { color: var(--primary); border-bottom: 2px solid var(--primary); }
-      .modal-overlay { position: fixed; inset: 0; background: rgba(0,0,0,0.8); display: none; justify-content: center; align-items: center; z-index: 1000; }
-      .modal { background: var(--surface); padding: 2rem; border-radius: 15px; width: 420px; border: 1px solid var(--border); }
-      .audio-toggle { font-size: 0.7rem; color: #94a3b8; display: flex; align-items: center; gap: 5px; cursor: pointer; margin-right: 15px;}
-      .form-group { margin-bottom: 1rem; }
-      .form-group label { display: block; margin-bottom: 5px; font-size: 0.8rem; color: #94a3b8; }
-      .form-group input { width: 100%; padding: 8px; border-radius: 6px; background: #0f172a; border: 1px solid var(--border); color: white; box-sizing: border-box; }
-      .chart-toggle-group { position: absolute; top: 1rem; right: 1rem; display: flex; gap: 5px; z-index: 10; }
-      .chart-toggle-btn { padding: 4px 10px; font-size: 0.7rem; border-radius: 6px; border: 1px solid var(--border); background: #0f172a; color: #94a3b8; cursor: pointer; }
-      .chart-toggle-btn.active { background: var(--primary); color: white; border: none; }
-      .charts-wrapper { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 1rem; }
-    </style>
-  </head>
-  <body>
-    <nav>
-      <div style="font-weight:bold; letter-spacing:1px;">BHS <span style="color:var(--primary)">ADMIN</span></div>
-      <div style="display:flex; align-items:center;">
-        <button id="installBtn" class="btn btn-primary">📲 Install App</button>
-        <label class="audio-toggle">
-          <input type="checkbox" id="audioEnable" onchange="requestNotifyPermission()"> 🔊 Alerts
-        </label>
-        <span class="pulse"></span>
-        <span id="nav-active" class="badge status-green">${data.activeCount} DEVICES ONLINE</span>
-      </div>
-    </nav>
-
-    <div class="container">
-      <div class="filter-bar">
-        <input type="text" id="searchInput" class="search-input" placeholder="Search MAC or Phone..." oninput="debounceSearch()">
-        <select id="deviceFilter" onchange="loadPage(1)" class="btn">
-          <option value="all">All Gateways</option>
-          ${data.locations.map(loc => `<option value="${loc.gatewayname}" ${currentDevice === loc.gatewayname ? 'selected' : ''}>${loc.gatewayname}</option>`).join('')}
-        </select>
-        <select id="statusFilter" onchange="loadPage(1)" class="btn">
-          <option value="all" ${currentStatus === 'all' ? 'selected' : ''}>All Status</option>
-          <option value="authenticated" ${currentStatus === 'authenticated' ? 'selected' : ''}>Authenticated</option>
-          <option value="pending" ${currentStatus === 'pending' ? 'selected' : ''}>Pending</option>
-        </select>
-        <select id="minuteFilter" onchange="loadPage(1)" class="btn">
-          <option value="all" ${currentMinuteFilter === 'all' ? 'selected' : ''}>All Minutes</option>
-          <option value="has_minutes" ${currentMinuteFilter === 'has_minutes' ? 'selected' : ''}>Has Minutes Left</option>
-          <option value="zero_minutes" ${currentMinuteFilter === 'zero_minutes' ? 'selected' : ''}>0 Minutes Left</option>
-        </select>
-        <button class="btn btn-primary" onclick="downloadReport()">Export CSV</button>
-      </div>
-
-      <div class="tabs">
-        <button id="tab-overview" class="tab-btn active" onclick="switchTab('overview')">Insights</button>
-        <button id="tab-activity" class="tab-btn" onclick="switchTab('activity')">User Sessions</button>
-        <button id="tab-packages" class="tab-btn" onclick="switchTab('packages')">Price Packages</button>
-      </div>
-
-      <div id="overview" class="tab-content">
-        <div class="stats-grid">
-          <div class="stat-card"><small>DAILY REVENUE</small><div id="stat-daily">KES ${data.earnings.daily.toLocaleString()}</div></div>
-          <div class="stat-card"><small>WEEKLY REVENUE</small><div id="stat-weekly">KES ${data.earnings.weekly.toLocaleString()}</div></div>
-          <div class="stat-card"><small>MONTHLY REVENUE</small><div id="stat-monthly">KES ${data.earnings.monthly.toLocaleString()}</div></div>
-        </div>
-        <div class="charts-wrapper">
-            <div class="stat-card" style="height:350px">
-              <div class="chart-toggle-group">
-                <button class="chart-toggle-btn active" onclick="setChartRange('daily')">Daily</button>
-                <button class="chart-toggle-btn" onclick="setChartRange('weekly')">Weekly</button>
-                <button class="chart-toggle-btn" onclick="setChartRange('monthly')">Monthly</button>
+      <!DOCTYPE html>
+      <html lang="en">
+      <head>
+        <meta charset="UTF-8">
+        <meta name="viewport" content="width=device-width, initial-scale=1.0">
+        <title>BHS PRO Dashboard</title>
+        <link rel="manifest" href="/manifest.json">
+        <meta name="theme-color" content="#3b82f6">
+        <meta name="apple-mobile-web-app-capable" content="yes">
+        <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+        <style>
+          :root { --primary: #3b82f6; --bg: #0f172a; --surface: #1e293b; --text: #f8fafc; --border: #334155; --secondary: #10b981; }
+          body { background: var(--bg); color: var(--text); font-family: 'Inter', system-ui, sans-serif; margin: 0; }
+          nav { background: #020617; padding: 1rem 2rem; display: flex; justify-content: space-between; align-items: center; border-bottom: 1px solid var(--border); }
+          .container { max-width: 1200px; margin: 1.5rem auto; padding: 0 20px; }
+          .stats-grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(200px, 1fr)); gap: 1rem; margin-bottom: 1.5rem; }
+          .stat-card { background: var(--surface); padding: 1.5rem; border-radius: 16px; border: 1px solid var(--border); position: relative; box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1), 0 2px 4px -1px rgba(0,0,0,0.06); transition: 0.3s; }
+          .stat-card:hover { transform: translateY(-2px); box-shadow: 0 10px 15px -3px rgba(0,0,0,0.1); }
+          .stat-value { font-size: 1.5rem; font-weight: 800; margin: 0.5rem 0; color: var(--text); }
+          .stat-label { font-size: 0.7rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; font-weight: 600; }
+          .stat-trend { display: flex; align-items: center; gap: 4px; }
+          .filter-bar { display: flex; gap: 12px; margin-bottom: 1.5rem; flex-wrap: wrap; }
+          .search-input { flex-grow: 1; padding: 0.6rem 1rem; border-radius: 10px; border: 1px solid var(--border); background: #0f172a; color: white; transition: 0.3s; }
+          .search-input:focus { border-color: var(--primary); outline: none; }
+          table { width: 100%; border-collapse: separate; border-spacing: 0; background: var(--surface); border-radius: 16px; overflow: hidden; border: 1px solid var(--border); }
+          th { background: #263449; text-align: left; padding: 14px; font-size: 0.75rem; color: #94a3b8; text-transform: uppercase; letter-spacing: 0.05em; }
+          td { padding: 14px; border-bottom: 1px solid var(--border); font-size: 0.85rem; }
+          tr:last-child td { border-bottom: none; }
+          .badge { padding: 4px 10px; border-radius: 20px; font-size: 0.65rem; font-weight: 700; text-transform: uppercase; }
+          .status-green { background: rgba(16,185,129,0.15); color: #34d399; border: 1px solid rgba(16,185,129,0.2); }
+          .status-yellow { background: rgba(245,158,11,0.15); color: #fbbf24; border: 1px solid rgba(245,158,11,0.2); }
+          .pulse { width: 8px; height: 8px; background: #34d399; border-radius: 50%; display: inline-block; margin-right: 8px; animation: pulse 2s infinite; }
+          @keyframes pulse { 0% { opacity: 1; transform: scale(1); } 50% { opacity: 0.4; transform: scale(1.2); } 100% { opacity: 1; transform: scale(1); } }
+          .btn { padding: 0.6rem 1.2rem; border-radius: 10px; border: 1px solid var(--border); background: #334155; color: white; cursor: pointer; font-weight: 600; font-size: 0.85rem; transition: 0.2s; display: flex; align-items: center; gap: 8px; }
+          .btn:hover { background: #475569; }
+          .btn-primary { background: var(--primary); border: none; }
+          .btn-primary:hover { background: #2563eb; }
+          #installBtn { display: none; margin-right: 15px; background: #10b981; border: none; font-weight: 700; }
+          .tabs { display: flex; gap: 8px; margin-bottom: 1.5rem; background: #020617; padding: 4px; border-radius: 12px; border: 1px solid var(--border); width: fit-content; }
+          .tab-btn { background: none; border: none; color: #94a3b8; padding: 8px 16px; cursor: pointer; font-weight: 600; transition: 0.2s; border-radius: 8px; font-size: 0.85rem; }
+          .tab-btn:hover { color: white; }
+          .tab-btn.active { color: white; background: var(--surface); box-shadow: 0 4px 6px -1px rgba(0,0,0,0.1); }
+          .modal-overlay { position: fixed; inset: 0; background: rgba(2,6,23,0.85); display: none; justify-content: center; align-items: center; z-index: 1000; backdrop-filter: blur(8px); }
+          .modal { background: var(--surface); padding: 2rem; border-radius: 24px; width: 440px; border: 1px solid var(--border); box-shadow: 0 25px 50px -12px rgba(0,0,0,0.5); }
+          .audio-toggle { font-size: 0.75rem; color: #94a3b8; display: flex; align-items: center; gap: 8px; cursor: pointer; margin-right: 15px; font-weight: 600;}
+          .form-group { margin-bottom: 1.25rem; }
+          .form-group label { display: block; margin-bottom: 6px; font-size: 0.8rem; color: #94a3b8; font-weight: 600; }
+          .form-group input { width: 100%; padding: 10px 12px; border-radius: 8px; background: #0f172a; border: 1px solid var(--border); color: white; box-sizing: border-box; transition: 0.3s; }
+          .form-group input:focus { border-color: var(--primary); outline: none; }
+          .chart-toggle-group { display: flex; gap: 6px; padding: 4px; background: #0f172a; border-radius: 8px; border: 1px solid var(--border); }
+          .chart-toggle-btn { padding: 4px 12px; font-size: 0.7rem; border-radius: 6px; border: none; background: transparent; color: #94a3b8; cursor: pointer; font-weight: 600; transition: 0.2s; }
+          .chart-toggle-btn:hover { color: white; }
+          .chart-toggle-btn.active { background: var(--primary); color: white; }
+          .charts-wrapper { display: grid; grid-template-columns: repeat(auto-fit, minmax(400px, 1fr)); gap: 1.5rem; }
+          .chart-card { background: var(--surface); padding: 1.5rem; border-radius: 20px; border: 1px solid var(--border); height: 380px; position: relative; }
+          .chart-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 1rem; }
+          .chart-title { font-size: 0.75rem; color: #94a3b8; font-weight: 800; text-transform: uppercase; letter-spacing: 0.1em; }
+        </style>
+      </head>
+      <body>
+        <nav>
+          <div style="font-weight:900; letter-spacing:1.5px; font-size:1.2rem;">BHS <span style="color:var(--primary)">ADMIN</span> <span style="font-size:0.6rem; vertical-align:middle; background:var(--primary); padding:2px 6px; border-radius:4px; margin-left:4px;">PRO</span></div>
+          <div style="display:flex; align-items:center;">
+            <button id="installBtn" class="btn btn-primary">📲 Install App</button>
+            <label class="audio-toggle">
+              <input type="checkbox" id="audioEnable" onchange="requestNotifyPermission()"> Alerts
+            </label>
+            <span class="pulse"></span>
+            <span id="nav-active" class="badge status-green">${data.activeCount} ONLINE</span>
+          </div>
+        </nav>
+    
+        <div class="container">
+          <div class="filter-bar">
+            <input type="text" id="searchInput" class="search-input" placeholder="Search MAC or Phone..." oninput="debounceSearch()">
+            <select id="deviceFilter" onchange="loadPage(1)" class="btn">
+              <option value="all">All Gateways</option>
+              ${data.locations.map(loc => `<option value="${loc.gatewayname}" ${currentDevice === loc.gatewayname ? 'selected' : ''}>${loc.gatewayname}</option>`).join('')}
+            </select>
+            <select id="statusFilter" onchange="loadPage(1)" class="btn">
+              <option value="all" ${currentStatus === 'all' ? 'selected' : ''}>All Status</option>
+              <option value="authenticated" ${currentStatus === 'authenticated' ? 'selected' : ''}>Authenticated</option>
+              <option value="pending" ${currentStatus === 'pending' ? 'selected' : ''}>Pending</option>
+            </select>
+            <select id="minuteFilter" onchange="loadPage(1)" class="btn">
+              <option value="all" ${currentMinuteFilter === 'all' ? 'selected' : ''}>All Minutes</option>
+              <option value="has_minutes" ${currentMinuteFilter === 'has_minutes' ? 'selected' : ''}>Has Minutes Left</option>
+              <option value="zero_minutes" ${currentMinuteFilter === 'zero_minutes' ? 'selected' : ''}>0 Minutes Left</option>
+            </select>
+            <button class="btn btn-primary" onclick="downloadReport()">Export CSV</button>
+          </div>
+    
+          <div class="tabs">
+            <button id="tab-overview" class="tab-btn active" onclick="switchTab('overview')">Insights</button>
+            <button id="tab-activity" class="tab-btn" onclick="switchTab('activity')">User Sessions</button>
+            <button id="tab-packages" class="tab-btn" onclick="switchTab('packages')">Price Packages</button>
+          </div>
+    
+          <div id="overview" class="tab-content">
+            <div class="stats-grid">
+              <div class="stat-card">
+                <div class="stat-label">DAILY REVENUE</div>
+                <div class="stat-value" id="stat-daily">KES ${data.earnings.daily.toLocaleString()}</div>
+                <div class="stat-trend">${dailyTrend} <span class="stat-label" style="font-size:0.6rem; margin-left:4px">vs yesterday</span></div>
               </div>
-              <canvas id="revenueChart"></canvas>
+              <div class="stat-card">
+                <div class="stat-label">WEEKLY REVENUE</div>
+                <div class="stat-value" id="stat-weekly">KES ${data.earnings.weekly.toLocaleString()}</div>
+                <div class="stat-trend">${weeklyTrend} <span class="stat-label" style="font-size:0.6rem; margin-left:4px">vs prev week</span></div>
+              </div>
+              <div class="stat-card">
+                <div class="stat-label">MONTHLY REVENUE</div>
+                <div class="stat-value" id="stat-monthly">KES ${data.earnings.monthly.toLocaleString()}</div>
+                <div class="stat-trend">${monthlyTrend} <span class="stat-label" style="font-size:0.6rem; margin-left:4px">vs prev month</span></div>
+              </div>
             </div>
-            <div class="stat-card" style="height:350px">
-                <small style="color:#94a3b8; position:absolute; top:1rem; left:1rem; font-weight:bold;">MINUTE USAGE (24H)</small>
-                <canvas id="minuteChart"></canvas>
+            <div class="charts-wrapper">
+                <div class="chart-card">
+                  <div class="chart-header">
+                    <div class="chart-title">Revenue Trends</div>
+                    <div class="chart-toggle-group">
+                      <button class="chart-toggle-btn active" onclick="setChartRange('daily')">Daily</button>
+                      <button class="chart-toggle-btn" onclick="setChartRange('weekly')">Weekly</button>
+                      <button class="chart-toggle-btn" onclick="setChartRange('monthly')">Monthly</button>
+                    </div>
+                  </div>
+                  <div style="height:280px"><canvas id="revenueChart"></canvas></div>
+                </div>
+                <div class="chart-card">
+                    <div class="chart-header">
+                        <div class="chart-title">Minute Usage (24H)</div>
+                    </div>
+                    <div style="height:280px"><canvas id="minuteChart"></canvas></div>
+                </div>
             </div>
-        </div>
-      </div>
+          </div>
 
       <div id="activity" class="tab-content" style="display:none">
         <table>
@@ -640,37 +768,78 @@ function generateAdminUI(data, currentStatus, currentDevice, currentMinuteFilter
         if (!data) return;
         const ctx = document.getElementById('revenueChart').getContext('2d');
         if(myChart) myChart.destroy();
+        
+        const gradient = ctx.createLinearGradient(0, 0, 0, 300);
+        gradient.addColorStop(0, 'rgba(59, 130, 246, 0.4)');
+        gradient.addColorStop(1, 'rgba(59, 130, 246, 0)');
+
+        const prevGradient = ctx.createLinearGradient(0, 0, 0, 300);
+        prevGradient.addColorStop(0, 'rgba(148, 163, 184, 0.1)');
+        prevGradient.addColorStop(1, 'rgba(148, 163, 184, 0)');
+
         myChart = new Chart(ctx, {
           type: 'line',
           data: {
             labels: data.map(d => d.time),
-            datasets: [{ 
-              label: 'Cumulative Revenue', 
-              data: data.map(d => d.total), 
-              borderColor: '#3b82f6', 
-              borderWidth: 3,
-              tension: 0.1, 
-              fill: true, 
-              pointRadius: 0,
-              backgroundColor: 'rgba(59,130,246,0.2)' 
-            }]
+            datasets: [
+              { 
+                label: 'Current Period', 
+                data: data.map(d => d.total), 
+                borderColor: '#3b82f6', 
+                borderWidth: 3,
+                tension: 0.4, 
+                fill: true, 
+                backgroundColor: gradient,
+                pointRadius: 4,
+                pointBackgroundColor: '#3b82f6',
+                pointBorderColor: '#0f172a',
+                pointBorderWidth: 2,
+                pointHoverRadius: 6
+              },
+              { 
+                label: 'Previous Period', 
+                data: data.map(d => d.prev_total), 
+                borderColor: '#64748b', 
+                borderWidth: 2,
+                borderDash: [5, 5],
+                tension: 0.4, 
+                fill: true, 
+                backgroundColor: prevGradient,
+                pointRadius: 0,
+                pointHoverRadius: 4
+              }
+            ]
           },
           options: { 
             responsive: true, 
             maintainAspectRatio: false, 
+            interaction: { mode: 'index', intersect: false },
             plugins: { 
-                legend: { display: false },
+                legend: { 
+                  display: true, 
+                  position: 'bottom',
+                  labels: { color: '#94a3b8', boxWidth: 12, usePointStyle: true, padding: 20 }
+                },
                 tooltip: {
-                    mode: 'index',
-                    intersect: false,
+                    backgroundColor: '#1e293b',
+                    titleColor: '#94a3b8',
+                    bodyColor: '#f8fafc',
+                    borderColor: '#334155',
+                    borderWidth: 1,
+                    padding: 12,
+                    displayColors: true,
                     callbacks: {
-                        label: function(context) { return 'Cumulative: KES ' + context.parsed.y.toLocaleString(); }
+                        label: function(context) { return context.dataset.label + ': KES ' + context.parsed.y.toLocaleString(); }
                     }
                 }
             },
             scales: {
-              x: { grid: { display: false }, ticks: { color: '#94a3b8', maxTicksLimit: 12 } },
-              y: { grid: { color: '#334155' }, ticks: { color: '#94a3b8' }, beginAtZero: true }
+              x: { grid: { display: false }, ticks: { color: '#64748b', maxTicksLimit: 12, font: { size: 10 } } },
+              y: { 
+                grid: { color: 'rgba(51, 65, 85, 0.5)', borderDash: [2, 2] }, 
+                ticks: { color: '#64748b', font: { size: 10 }, callback: value => 'KES ' + value.toLocaleString() },
+                beginAtZero: true 
+              }
             }
           }
         });
@@ -680,6 +849,11 @@ function generateAdminUI(data, currentStatus, currentDevice, currentMinuteFilter
         if (!data) return;
         const ctx = document.getElementById('minuteChart').getContext('2d');
         if(myMinChart) myMinChart.destroy();
+
+        const gradient = ctx.createLinearGradient(0, 0, 0, 300);
+        gradient.addColorStop(0, 'rgba(16, 185, 129, 0.8)');
+        gradient.addColorStop(1, 'rgba(16, 185, 129, 0.2)');
+
         myMinChart = new Chart(ctx, {
             type: 'bar',
             data: {
@@ -687,18 +861,29 @@ function generateAdminUI(data, currentStatus, currentDevice, currentMinuteFilter
                 datasets: [{
                     label: 'Minutes Sold',
                     data: data.map(d => d.total_mins),
-                    backgroundColor: 'rgba(16, 185, 129, 0.5)',
-                    borderColor: '#10b981',
-                    borderWidth: 1
+                    backgroundColor: gradient,
+                    borderRadius: 6,
+                    hoverBackgroundColor: '#10b981'
                 }]
             },
             options: {
                 responsive: true,
                 maintainAspectRatio: false,
-                plugins: { legend: { display: false } },
+                plugins: { 
+                  legend: { display: false },
+                  tooltip: {
+                    backgroundColor: '#1e293b',
+                    padding: 12,
+                    callbacks: { label: context => context.parsed.y.toLocaleString() + ' mins' }
+                  }
+                },
                 scales: {
-                    x: { grid: { display: false }, ticks: { color: '#94a3b8', maxTicksLimit: 8 } },
-                    y: { grid: { color: '#334155' }, ticks: { color: '#94a3b8' }, beginAtZero: true }
+                    x: { grid: { display: false }, ticks: { color: '#64748b', maxTicksLimit: 8, font: { size: 10 } } },
+                    y: { 
+                      grid: { color: 'rgba(51, 65, 85, 0.5)', borderDash: [2, 2] }, 
+                      ticks: { color: '#64748b', font: { size: 10 } }, 
+                      beginAtZero: true 
+                    }
                 }
             }
         });
