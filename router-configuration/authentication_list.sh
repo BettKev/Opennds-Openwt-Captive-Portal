@@ -57,6 +57,7 @@ while true; do
     fi
 
     # 3. HOURLY MAINTENANCE
+    # Restart opennds every hour to keep it from failing/crashing
     COUNTER=$((COUNTER + 1))
     if [ "$COUNTER" -ge "$RELOAD_THRESHOLD" ]; then
         /etc/init.d/opennds restart
