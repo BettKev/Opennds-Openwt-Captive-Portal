@@ -12,7 +12,7 @@ export default {
         description: "Dashboard for BHS Client Sessions",
         start_url: "/",
         display: "standalone",
-        background_color: "#0f172a",
+        background_color: "#e6ed23",
         theme_color: "#3bf64e",
         icons: [{
           src: "https://cdn-icons-png.flaticon.com/512/3135/3135706.png",
