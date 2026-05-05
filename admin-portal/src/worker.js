@@ -444,7 +444,7 @@ function generateAdminUI(data, currentStatus, currentDevice, currentMinuteFilter
           <div class="tabs">
             <button id="tab-overview" class="tab-btn active" onclick="switchTab('overview')">Insights</button>
             <button id="tab-activity" class="tab-btn" onclick="switchTab('activity')">User Sessions</button>
-            <button id="tab-packages" class="tab-btn" onclick="switchTab('packages')">Price Packages</button>
+            <button id="tab-packages" class="tab-btn" onclick="switchTab('packages')">Packages</button>
           </div>
     
           <div id="overview" class="tab-content">
