@@ -414,7 +414,7 @@ function generateAdminUI(data, currentStatus, currentDevice, currentMinuteFilter
           <div style="display:flex; align-items:center;">
             <button id="installBtn" class="btn btn-primary">📲 Install App</button>
             <label class="audio-toggle">
-              <input type="checkbox" id="audioEnable" onchange="requestNotifyPermission()"> Alerts
+              <input type="checkbox" id="audioEnable" onchange="requestNotifyPermission()" checked> Alerts
             </label>
             <span class="pulse"></span>
             <span id="nav-active" class="badge status-green">${data.activeCount} ONLINE</span>
