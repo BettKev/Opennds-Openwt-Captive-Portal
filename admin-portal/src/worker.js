@@ -13,7 +13,7 @@ export default {
         start_url: "/",
         display: "standalone",
         background_color: "#0f172a",
-        theme_color: "#3b82f6",
+        theme_color: "#3bf64e",
         icons: [{
           src: "https://cdn-icons-png.flaticon.com/512/3135/3135706.png",
           sizes: "512x512",
