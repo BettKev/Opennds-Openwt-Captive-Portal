@@ -1,0 +1,56 @@
+:root {
+    --bg-color: #090909;
+    --text-color: #ffffff;
+    --font-stack: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+    font-size: 90%; 
+}
+
+/* Base scaling for responsiveness */
+@media screen and (min-width: 480px) { :root { font-size: 90%; } }
+@media screen and (min-width: 768px) { :root { font-size: 95%; } }
+@media screen and (min-width: 1024px) { :root { font-size: 100%; } }
+@media screen and (min-width: 1440px) { :root { font-size: 106.25%; } }
+
+/* Global reset to prevent unexpected spacing layout bugs */
+*, *::before, *::after {
+    box-sizing: border-box;
+    margin: 0;
+    padding: 0;
+}
+
+body {
+    background-color: var(--bg-color);
+    background-size: cover;
+    background-position: center;
+    background-attachment: fixed;
+    background-repeat: no-repeat;
+    color: var(--text-color);
+    font-family: var(--font-stack);
+    
+    display: flex;
+    justify-content: center;
+    align-items: center;
+    
+    min-height: 100vh; 
+    min-height: 100dvh;
+    padding: 20px;
+    text-align: center; 
+}
+
+/* --- THE FIX FOR BIG SCREENS --- */
+/* Target Laptops/Desktops (typically 1024px wide and up) */
+@media screen and (min-width: 1024px) {
+    html, body {
+        height: 100vh;         /* Force strict viewport height */
+        width: 100vw;          /* Force strict viewport width */
+        overflow: hidden;      /* Disables both horizontal and vertical scrolling completely */
+    }
+
+    /* Target your main application container if you have one */
+    .app-container {
+        width: 100%;
+        height: 100%;
+        max-width: 100%;
+        max-height: 100%;
+    }
+}
