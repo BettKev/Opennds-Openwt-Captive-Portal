@@ -28,3 +28,8 @@ This project is composed of three directories each with a specific function
 
 ## Setup
 The cloudflare workers can be deployed via wrangler CLI from your terminal. Ensure to have a cloudflare account setup and linked
+
+
+## UPDATES
+Build new frontend running on react vite with typescript support
+Shift worker logic for frontend rendering to the react application. Keep all backend logic in cloudflare workers
