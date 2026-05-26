@@ -16,13 +16,16 @@ const App: React.FC = () => {
         <div>
           <p>Welcome to our wifi. Please select a category to proceed.</p>
           <div className="button-container" style={{ display: 'flex', flexDirection: 'column', alignItems: 'center', gap: '10px', margin: '20px 0' }}>
+            <br></br>
+            <p>Click this button if you want to access the wifi as an individual user.</p>
             <button 
               style={{ padding: '12px 24px', fontSize: '16px', width: '220px', cursor: 'pointer', fontWeight: 'bold' }} 
               onClick={() => setCurrentView('individual')}
             >
               Individual User
             </button>
-            
+            <br></br>
+            <p>Click this button if you are a corporate client.</p>
             <button 
               style={{ padding: '12px 24px', fontSize: '16px', width: '220px', cursor: 'pointer', fontWeight: 'bold' }} 
               onClick={() => setCurrentView('corporate')}
