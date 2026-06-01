@@ -5,7 +5,7 @@ interface IndividualLoginProps {
 }
 
 // Simulated Router Gateway URL (Captive Portal endpoint)
-const ROUTER_GATEWAY_URL = "http://10.0.0.1/login"; 
+// const ROUTER_GATEWAY_URL = "http://10.0.0.1/login"; 
 
 type AuthStep = 'IDLE' | 'STK_PUSH_SENT' | 'VERIFYING' | 'ROUTER_AUTH' | 'SUCCESS';
 
@@ -28,7 +28,7 @@ const IndividualLogin: React.FC<IndividualLoginProps> = ({ onBack }) => {
 
   // Simulated Countdown timer for Safaricom STK response
   useEffect(() => {
-    let timer: NodeJS.Timeout;
+    let timer: ReturnType<typeof setTimeout>;
     if (authStep === 'STK_PUSH_SENT' && countdown > 0) {
       timer = setTimeout(() => setCountdown(countdown - 1), 1000);
     } else if (authStep === 'STK_PUSH_SENT' && countdown === 0) {
