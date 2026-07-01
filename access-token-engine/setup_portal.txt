@@ -5,12 +5,26 @@ echo "===================================================="
 echo "    Unified Hotel Admin Portal COMPAT Mode          "
 echo "===================================================="
 
-# Discover the current LAN IP address dynamically
-LAN_IP=$(ubus call network.interface.lan status 2>/dev/null | grep -A2 '"ipv4-address"' | grep '"address"' | awk -F'"' '{print $4}')
-if [ -z "$LAN_IP" ]; then
-    LAN_IP=$(ifconfig br-lan 2>/dev/null | grep 'inet addr:' | awk -F: '{print $2}' | awk '{print $1}')
+# Discover the current LAN IP address dynamically for reference
+DEFAULT_IP=$(ubus call network.interface.lan status 2>/dev/null | grep -A2 '"ipv4-address"' | grep '"address"' | awk -F'"' '{print $4}')
+if [ -z "$DEFAULT_IP" ]; then
+    DEFAULT_IP=$(ifconfig br-lan 2>/dev/null | grep 'inet addr:' | awk -F: '{print $2}' | awk '{print $1}')
 fi
-[ -z "$LAN_IP" ] && LAN_IP="192.168.1.1"
+[ -z "$DEFAULT_IP" ] && DEFAULT_IP="192.168.1.1"
+
+# Prompt the operator for the desired target LAN IP Address
+printf "Enter the desired Router LAN IP Address [%s]: " "$DEFAULT_IP"
+read -r USER_IP
+[ -z "$USER_IP" ] && USER_IP="$DEFAULT_IP"
+LAN_IP="$USER_IP"
+
+# Stage the network interface configuration change via UCI (Do NOT restart network yet)
+echo "[*] Staging network interface lan update to: ${LAN_IP}..."
+if [ -f /etc/config/network ]; then
+    uci set network.lan.proto='static'
+    uci set network.lan.ipaddr="$LAN_IP"
+    uci commit network
+fi
 
 # 1. Prepare web space
 mkdir -p /www/cgi-bin
@@ -21,28 +35,60 @@ mkdir -p /www/cgi-bin
 # 2. Configure Web Server to Catch and Redirect Canary Requests (With LuCI Hijack Fix)
 echo "[*] Optimizing web server for captive portal detection..."
 if [ -f /etc/config/uhttpd ]; then
-    # Wipe native LuCI direct mapping variables that hijack base routing
     uci del uhttpd.main.lua_prefix 2>/dev/null
     uci del uhttpd.main.lua_handler 2>/dev/null
     uci del uhttpd.main.ubus_prefix 2>/dev/null
     
-    # Force absolute root fallbacks directly into our captive index binary 
     uci set uhttpd.main.index_page='cgi-bin/index'
     uci set uhttpd.main.error_page='/cgi-bin/index'
     uci commit uhttpd
     /etc/init.d/uhttpd restart 2>/dev/null
 fi
 
-# 3. Inject DHCP Option 114 & Disable Rebind Protection
+# 3. Handle DNS/DHCP Settings & Inject Dynamic Boot script
 echo "[*] Optimizing DNS/DHCP settings..."
 if [ -f /etc/config/dhcp ]; then
+    # Clean up old Option 114 formats if they exist
     uci del_list dhcp.lan.dhcp_option="114,http://192.168.1.1/cgi-bin/index" 2>/dev/null
+    uci del_list dhcp.lan.dhcp_option="114,http://${DEFAULT_IP}/cgi-bin/index" 2>/dev/null
     uci del_list dhcp.lan.dhcp_option="114,http://${LAN_IP}/cgi-bin/index" 2>/dev/null
+    
+    # Inject the immediate target option for this current session run
     uci add_list dhcp.lan.dhcp_option="114,http://${LAN_IP}/cgi-bin/index"
     uci set dhcp.@dnsmasq[0].rebind_protection='0'
     uci commit dhcp
-    /etc/init.d/dnsmasq restart 2>/dev/null
 fi
+
+echo "[*] Creating dynamic boot updater for DHCP option 114..."
+cat << 'BOOT_EOF' > /etc/init.d/portal_dhcp
+#!/bin/sh /etc/rc.common
+
+START=19
+
+boot() {
+    # Dynamically find what LAN IP the router actually picked up on boot
+    LIVE_IP=$(ubus call network.interface.lan status 2>/dev/null | grep -A2 '"ipv4-address"' | grep '"address"' | awk -F'"' '{print $4}')
+    [ -z "$LIVE_IP" ] && LIVE_IP=$(ifconfig br-lan 2>/dev/null | grep 'inet addr:' | awk -F: '{print $2}' | awk '{print $1}')
+    [ -z "$LIVE_IP" ] && LIVE_IP="192.168.1.1"
+
+    # Delete any legacy or mismatch entries safely from memory array
+    while uci show dhcp.lan.dhcp_option 2>/dev/null | grep -q "114,"; do
+        OLD_OPT=$(uci show dhcp.lan.dhcp_option 2>/dev/null | grep "114," | head -n 1 | awk -F"='" '{print $2}' | sed "s/'//g")
+        [ -n "$OLD_OPT" ] && uci del_list dhcp.lan.dhcp_option="$OLD_OPT"
+    done
+
+    # Add the current true IP translation route and commit
+    uci add_list dhcp.lan.dhcp_option="114,http://${LIVE_IP}/cgi-bin/index"
+    uci commit dhcp
+    /etc/init.d/dnsmasq restart >/dev/null 2>&1
+}
+BOOT_EOF
+
+chmod +x /etc/init.d/portal_dhcp
+/etc/init.d/portal_dhcp enable 2>/dev/null
+
+# Restart dnsmasq to catch changes immediately
+/etc/init.d/dnsmasq restart 2>/dev/null
 
 # 4. Configure NATIVE FW3 Firewall Rules & Persistent Restart Wipes
 echo "[*] Injecting native firewall zones and redirection rules..."
@@ -91,7 +137,8 @@ FW_USER_EOF
     uci set firewall.@redirect[-1].proto='tcp'
     uci set firewall.@redirect[-1].target='DNAT'
     uci set firewall.@redirect[-1].dest='lan'
-    uci set firewall.@redirect[-1].dest_ip="$LAN_IP"
+    # dest_ip is omitted below; this forces the intercept rule to dynamically point to
+    # the router itself, regardless of whatever future IP changes happen on LAN.
     uci set firewall.@redirect[-1].dest_port='80'
 
     uci commit firewall
@@ -99,26 +146,30 @@ fi
 
 # 5. Create Splash Endpoint
 echo "[*] Creating Self-Configuring Splash Webpage..."
-cat << GUEST_EOF > /www/cgi-bin/index
+cat << 'GUEST_EOF' > /www/cgi-bin/index
 #!/bin/sh
-GUEST_IP="\$REMOTE_ADDR"
-GUEST_MAC=\$(grep "\$GUEST_IP " /proc/net/arp | awk '{print \$4}')
-[ -z "\$GUEST_MAC" ] && GUEST_MAC=\$(arp -a | grep "\$GUEST_IP" | awk '{print \$4}')
+GUEST_IP="$REMOTE_ADDR"
+GUEST_MAC=$(grep "$GUEST_IP " /proc/net/arp | awk '{print $4}')
+[ -z "$GUEST_MAC" ] && GUEST_MAC=$(arp -a | grep "$GUEST_IP" | awk '{print $4}')
 
-if [ "\$REQUEST_METHOD" = "POST" ] && [ "\$CONTENT_LENGTH" -gt 0 ]; then
-    read -n "\$CONTENT_LENGTH" POST_DATA
+DYNAMIC_LAN_IP=$(ubus call network.interface.lan status 2>/dev/null | grep -A2 '"ipv4-address"' | grep '"address"' | awk -F'"' '{print $4}')
+[ -z "$DYNAMIC_LAN_IP" ] && DYNAMIC_LAN_IP=$(ifconfig br-lan 2>/dev/null | grep 'inet addr:' | awk -F: '{print $2}' | awk '{print $1}')
+[ -z "$DYNAMIC_LAN_IP" ] && DYNAMIC_LAN_IP="192.168.1.1"
+
+if [ "$REQUEST_METHOD" = "POST" ] && [ "$CONTENT_LENGTH" -gt 0 ]; then
+    read -n "$CONTENT_LENGTH" POST_DATA
 fi
 
 STATUS_MSG=""
-if [ "\$REQUEST_METHOD" = "POST" ]; then
-    INPUT_CODE=\$(echo "\$POST_DATA" | sed -n 's/.*guest_code=\([^&]*\).*/\1/p' | tr 'a-z' 'A-Z')
-    ACTIVE_CODE=\$(cat /var/run/portal_code 2>/dev/null)
+if [ "$REQUEST_METHOD" = "POST" ]; then
+    INPUT_CODE=$(echo "$POST_DATA" | sed -n 's/.*guest_code=\([^&]*\).*/\1/p' | tr 'a-z' 'A-Z')
+    ACTIVE_CODE=$(cat /var/run/portal_code 2>/dev/null)
     
-    if [ -n "\$INPUT_CODE" ] && [ "\$INPUT_CODE" = "\$ACTIVE_CODE" ]; then
-        if [ -n "\$GUEST_MAC" ]; then
-            iptables -t nat -I prerouting_lan_rule 1 -m mac --mac-source "\$GUEST_MAC" -j ACCEPT
-            iptables -I forwarding_lan_rule 1 -m mac --mac-source "\$GUEST_MAC" -j ACCEPT
-            ip6tables -I forwarding_lan_rule 1 -m mac --mac-source "\$GUEST_MAC" -j ACCEPT
+    if [ -n "$INPUT_CODE" ] && [ "$INPUT_CODE" = "$ACTIVE_CODE" ]; then
+        if [ -n "$GUEST_MAC" ]; then
+            iptables -t nat -I prerouting_lan_rule 1 -m mac --mac-source "$GUEST_MAC" -j ACCEPT
+            iptables -I forwarding_lan_rule 1 -m mac --mac-source "$GUEST_MAC" -j ACCEPT
+            ip6tables -I forwarding_lan_rule 1 -m mac --mac-source "$GUEST_MAC" -j ACCEPT
             rm -f /var/run/portal_code
             STATUS_MSG="SUCCESS"
         else
@@ -129,10 +180,10 @@ if [ "\$REQUEST_METHOD" = "POST" ]; then
     fi
 fi
 
-if [ "\$QUERY_STRING" = "check_status" ]; then
+if [ "$QUERY_STRING" = "check_status" ]; then
     echo "Content-Type: text/plain"
     echo ""
-    if [ -n "\$GUEST_MAC" ] && iptables -t nat -C prerouting_lan_rule -m mac --mac-source "\$GUEST_MAC" -j ACCEPT 2>/dev/null; then
+    if [ -n "$GUEST_MAC" ] && iptables -t nat -C prerouting_lan_rule -m mac --mac-source "$GUEST_MAC" -j ACCEPT 2>/dev/null; then
         echo "ALLOWED"
     else
         echo "BLOCKED"
@@ -140,9 +191,9 @@ if [ "\$QUERY_STRING" = "check_status" ]; then
     exit 0
 fi
 
-if [ "\$HTTP_HOST" != "$LAN_IP" ] || [ "\$SCRIPT_NAME" != "/cgi-bin/index" ]; then
+if [ "$HTTP_HOST" != "$DYNAMIC_LAN_IP" ] || [ "$SCRIPT_NAME" != "/cgi-bin/index" ]; then
     echo "Status: 307 Temporary Redirect"
-    echo "Location: http://$LAN_IP/cgi-bin/index"
+    echo "Location: http://$DYNAMIC_LAN_IP/cgi-bin/index"
     echo "Content-Type: text/html"
     echo ""
     exit 0
@@ -274,12 +325,10 @@ if [ "$REQUEST_METHOD" = "POST" ]; then
         remove_whitelist)
             TARGET_MAC=$(echo "$POST_DATA" | sed -n 's/.*target_mac=\([^&]*\).*/\1/p' | sed 's/%3A/:/g' | tr 'A-Z' 'a-z')
             if [ -n "$TARGET_MAC" ]; then
-                # Flush actively out of memory layout
                 iptables -t nat -D prerouting_lan_rule -m mac --mac-source "$TARGET_MAC" -j ACCEPT 2>/dev/null
                 iptables -D forwarding_lan_rule -m mac --mac-source "$TARGET_MAC" -j ACCEPT 2>/dev/null
                 ip6tables -D forwarding_lan_rule -m mac --mac-source "$TARGET_MAC" -j ACCEPT 2>/dev/null
                 
-                # Delete completely from persistent store configuration
                 if [ -f /etc/firewall.user ]; then
                     sed -i "/$TARGET_MAC/d" /etc/firewall.user
                 fi
@@ -409,27 +458,26 @@ echo "<!DOCTYPE html>
             <div class='section-wrapper' style='border-bottom:none; margin-bottom:10px;'>
                 <h3>Permanently Whitelisted Devices</h3>"
                 
-                # Dynamic translation loop targeting the custom user ruleset 
                 if [ -f /etc/firewall.user ]; then
                     grep -oE '([0-9a-fA-F]{2}:){5}[0-9a-fA-F]{2}' /etc/firewall.user | tr 'A-Z' 'a-z' | sort -u | while read -r p_mac; do
                         [ -z "$p_mac" ] && continue
-                        UPPER_PMAC=$(echo "$p_mac" | tr 'a-z' 'A-Z')
+                        upper_pmac=$(echo "$p_mac" | tr 'a-z' 'A-Z')
                         echo "<div class='card' style='border-color:#ff3b30;'>"
-                        echo "<div><strong>MAC: $UPPER_PMAC</strong><br><small style='color:#aaaaaa;'>Persistent Whitelist</small></div>"
+                        echo "<div><strong>MAC: $upper_pmac</strong><br><small style='color:#aaaaaa;'>Persistent Whitelist</small></div>"
                         echo "<form method='POST'><input type='hidden' name='action' value='remove_whitelist'><input type='hidden' name='target_mac' value='$p_mac'><button type='submit' class='btn btn-revoke'>Revoke & Lock</button></form>"
                         echo "</div>"
                     done
                 fi
-echo "      </div>
+echo "       </div>
 
             <h3>Active Queue Devices (Authorized: $AUTH_COUNT)</h3>"
             
             while read -r time_val mac_val; do
                 [ -z "$mac_val" ] && continue
                 if ! iptables -t nat -C prerouting_lan_rule -m mac --mac-source "$mac_val" -j ACCEPT 2>/dev/null; then
-                    UPPER_MAC=$(echo "$mac_val" | tr 'a-z' 'A-Z')
+                    upper_mac=$(echo "$mac_val" | tr 'a-z' 'A-Z')
                     echo "<div class='card'>"
-                    echo "<div><strong>MAC: $UPPER_MAC</strong><br><small style='color:#888888;'>Volatile Device Queue</small></div>"
+                    echo "<div><strong>MAC: $upper_mac</strong><br><small style='color:#888888;'>Volatile Device Queue</small></div>"
                     echo "</div>"
                 fi
             done << EOL
@@ -447,14 +495,22 @@ PORTAL_EOF
 chmod +x /www/cgi-bin/portal
 chmod +x /www/cgi-bin/index
 
-# 7. Execute the formal reload sequence right now to finalize installation
+# 7. Execute formal reloads
 echo "[*] Triggering formal firewall system cycle..."
 /etc/init.d/firewall restart 2>/dev/null
 
 echo "===================================================="
-echo " ✅ SUCCESS: Portal Core Logic Armed!              "
+echo " ✅ SUCCESS: Portal Core Logic Armed!               "
 echo "===================================================="
+echo " ⚠️  WARNING: Network configuration is shifting right now."
+echo " Your current SSH session WILL drop. Reconnect to: http://${LAN_IP}"
+echo "===================================================="
+
+# Self-destruct setup runner code safely
 rm -- "$0"
+
+# Fork execution context out-of-band to prevent mid-execution terminal drops
+( sleep 2; /etc/init.d/network restart ) >/dev/null 2>&1 &
 EOF
 
 chmod +x /tmp/setup_portal.sh && /tmp/setup_portal.sh
