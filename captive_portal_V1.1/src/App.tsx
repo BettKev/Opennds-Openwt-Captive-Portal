@@ -48,7 +48,6 @@ const App: React.FC = () => {
 
       {/* FOOTER */}
       <hr style={{ margin: '30px auto', maxWidth: '500px', borderColor: '#eee' }} />
-      <p style={{ fontSize: '14px', color: '#555' }}>By using this wifi, you agree to our terms and conditions.</p>
       <p style={{ fontSize: '14px', fontWeight: 'bold' }}>This network is powered by BHS CYBER CAFE.</p>
       <p style={{ fontSize: '12px', color: '#777' }}>
         Visit our office for more information or contact us via cell 0707759220 or email birirhomesupplies@gmail.com
