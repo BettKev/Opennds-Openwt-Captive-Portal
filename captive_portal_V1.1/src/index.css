@@ -1,158 +1,240 @@
-:root {
-    --bg-color: #06060c; 
-    --accent-teal: #00f2fe;
-    --accent-purple: #7f00ff;
-    --text-color: #ffffff;
-    --font-stack: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
-    font-size: 90%; 
+@keyframes rainbowBG {
+  0% { background-position: 0% 50%; }
+  50% { background-position: 100% 50%; }
+  100% { background-position: 0% 50%; }
 }
 
-/* Base scaling for responsiveness */
-@media screen and (min-width: 480px) { :root { font-size: 90%; } }
-@media screen and (min-width: 768px) { :root { font-size: 95%; } }
-@media screen and (min-width: 1024px) { :root { font-size: 100%; } }
-@media screen and (min-width: 1440px) { :root { font-size: 106.25%; } }
+@keyframes spin {
+  0% { transform: rotate(0deg); }
+  100% { transform: rotate(360deg); }
+}
 
-/* Global reset to prevent unexpected spacing layout bugs */
-*, *::before, *::after {
-    box-sizing: border-box;
-    margin: 0;
-    padding: 0;
+@keyframes fadeIn {
+  from { opacity: 0; }
+  to { opacity: 1; }
 }
 
 body {
-    background-color: var(--bg-color);
-    color: var(--text-color);
-    font-family: var(--font-stack);
-    
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    
-    min-height: 100vh; 
-    min-height: 100dvh;
-    padding: 20px;
-    text-align: center; 
-    
-    position: relative;
-    overflow: hidden; 
-
-    /* Layer 1: Fixed background mesh and subtle cosmic center glow */
-    background-image: 
-        radial-gradient(circle at 50% 50%, rgba(127, 0, 255, 0.05) 0%, transparent 70%),
-        linear-gradient(rgba(0, 242, 254, 0.01) 1px, transparent 1px),
-        linear-gradient(90deg, rgba(0, 242, 254, 0.01) 1px, transparent 1px);
-    background-size: 100% 100%, 40px 40px, 40px 40px;
+  margin: 0;
+  padding: 0;
 }
 
-/* --- THE FIRST-LOAD INTRO OVERLAY (Unchanged - Keeps your perfect boot effect) --- */
-body::before {
-    content: 'INITIALIZING NETWORK...';
-    font-family: monospace;
-    font-size: 14px;
-    letter-spacing: 2px;
-    color: var(--accent-teal);
-    display: flex;
-    justify-content: center;
-    align-items: center;
-    
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100vw;
-    height: 100vh;
-    background: #030307;
-    z-index: 999;
-    
-    animation: portalBoot 1.8s cubic-bezier(0.85, 0, 0.15, 1) forwards;
-    box-shadow: inset 0 0 100px rgba(0, 242, 254, 0.2);
-}
-
-/* --- NEW BACKGROUND ENGINE: STATIC STARFIELD + TWINKLING DATA NODES --- */
-body::after {
-    content: '';
-    position: fixed;
-    top: 0;
-    left: 0;
-    width: 100vw;
-    height: 100vh;
-    pointer-events: none;
-    z-index: 0;
-
-    /* Multi-layered star matrices using radial CSS points */
-    background-image: 
-        /* Layer A: Tiny, dim background stars (Static) */
-        radial-gradient(1px 1px at 10% 20%, rgba(255, 255, 255, 0.25), transparent),
-        radial-gradient(1px 1px at 40% 70%, rgba(255, 255, 255, 0.2), transparent),
-        radial-gradient(1.5px 1.5px at 80% 40%, rgba(0, 242, 254, 0.3), transparent),
-        radial-gradient(1px 1px at 90% 80%, rgba(255, 255, 255, 0.15), transparent),
-        
-        /* Layer B: Medium "Data Stream Nodes" (Will twinkle via animation) */
-        radial-gradient(2px 2px at 25% 45%, rgba(0, 242, 254, 0.85), transparent),
-        radial-gradient(2px 2px at 60% 15%, rgba(255, 255, 255, 0.9), transparent),
-        radial-gradient(2.5px 2.5px at 75% 75%, rgba(127, 0, 255, 0.8), transparent),
-        radial-gradient(2px 2px at 35% 85%, rgba(0, 242, 254, 0.7), transparent);
-        
-    background-size: 100% 100%;
-    animation: nodeTwinkle 4s ease-in-out infinite alternate;
-}
-
-/* --- KEYFRAMES --- */
-@keyframes portalBoot {
-    0% { transform: translateY(0); opacity: 1; }
-    60% { transform: translateY(0); opacity: 1; color: #ffffff; text-shadow: 0 0 10px var(--accent-teal); }
-    99% { transform: translateY(-100vh); opacity: 1; }
-    100% { transform: translateY(-100vh); opacity: 0; pointer-events: none; }
-}
-
-/* Calmer, less intrusive star glistening/pulsing loop */
-@keyframes nodeTwinkle {
-    0% {
-        opacity: 0.5;
-        filter: brightness(0.8);
-    }
-    50% {
-        opacity: 0.8;
-        filter: brightness(1.2);
-    }
-    100% {
-        opacity: 0.6;
-        filter: brightness(0.9);
-    }
-}
-
-/* --- THE FIX FOR BIG SCREENS & COMPONENT LOAD ANIMATION --- */
-@media screen and (min-width: 1024px) {
-    html, body {
-        height: 100vh;         
-        width: 100vw;          
-        overflow: hidden;      
-    }
-}
-
+/* --- APP LAYOUT STYLES --- */
 .app-container {
-    width: 100%;
-    height: 100%;
-    max-width: 100%;
-    max-height: 100%;
-    position: relative;
-    z-index: 1; 
-    
-    opacity: 0;
-    transform: scale(0.96);
-    animation: uiReveal 0.6s cubic-bezier(0.16, 1, 0.3, 1) 1.5s forwards;
+  font-family: 'Inter', -apple-system, system-ui, sans-serif;
+  margin: 0;
+  min-height: 100vh;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  background: linear-gradient(-45deg, #ee7752, #e73c7e, #23a6d5, #23d5ab, #9b59b6, #f1c40f);
+  background-size: 600% 600%;
+  animation: rainbowBG 18s ease infinite;
+  color: #fff;
+  padding: '10px';
+  box-sizing: border-box;
+  overflow: hidden;
 }
 
-@keyframes uiReveal {
-    to {
-        opacity: 1;
-        transform: scale(1);
-    }
+.app-card {
+  background: rgba(10, 10, 10, 0.92);
+  padding: 22px;
+  border-radius: 30px;
+  backdrop-filter: blur(30px);
+  -webkit-backdrop-filter: blur(30px);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  max-width: 400px;
+  width: 100%;
+  box-shadow: 0 25px 50px rgba(0, 0, 0, 0.6);
 }
 
-/* Text stands out cleanly over dark starry canvas */
-h1, h2, h3, p, button, div, input, form {
-    position: relative;
-    z-index: 2;
-    text-shadow: 0 2px 5px rgba(0, 0, 0, 0.9);
+.debug-badge {
+  font-size: 9px;
+  text-align: right;
+  margin-bottom: 10px;
+  font-weight: bold;
+}
+
+.debug-live {
+  color: #2ecc71;
+}
+
+.debug-demo {
+  color: #f1c40f;
+}
+
+.app-title {
+  font-weight: 900;
+  margin: 0;
+  font-size: 24px;
+  color: #fff;
+  letter-spacing: -1px;
+  text-align: center;
+}
+
+.app-subhead {
+  color: #2ecc71;
+  font-size: 11px;
+  margin-bottom: 20px;
+  text-transform: uppercase;
+  letter-spacing: 3px;
+  font-weight: 800;
+  text-align: center;
+}
+
+.section-label {
+  text-align: left;
+  font-size: 10px;
+  font-weight: 900;
+  color: rgba(255, 255, 255, 0.6);
+  margin: 0 0 8px 5px;
+  text-transform: uppercase;
+  display: flex;
+  align-items: center;
+}
+
+.pkg-grid {
+  display: grid;
+  grid-template-columns: repeat(2, 1fr);
+  gap: 10px;
+  margin-bottom: 20px;
+}
+
+.pkg-card {
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  padding: 12px 5px;
+  border-radius: 14px;
+  cursor: pointer;
+  transition: 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  position: relative;
+}
+
+.pkg-card.selected {
+  border: 2.5px solid #2ecc71;
+  background: rgba(46, 204, 113, 0.2);
+  transform: translateY(-3px);
+  box-shadow: 0 10px 20px rgba(0, 0, 0, 0.3);
+}
+
+.pkg-name {
+  font-size: 10px;
+  opacity: 0.9;
+  margin-bottom: 2px;
+  font-weight: 700;
+  text-transform: uppercase;
+}
+
+.pkg-price {
+  font-size: 18px;
+  font-weight: 900;
+}
+
+.pkg-speed {
+  font-size: 9px;
+  background: #2ecc71;
+  color: #000;
+  padding: 2px 6px;
+  border-radius: 8px;
+  margin-top: 4px;
+  font-weight: 800;
+  text-transform: uppercase;
+}
+
+.input-container {
+  background: rgba(255, 255, 255, 0.04);
+  border-radius: 16px;
+  padding: 12px;
+  border: 1px solid rgba(255, 255, 255, 0.18);
+  margin-bottom: 15px;
+}
+
+.phone-input {
+  width: 100%;
+  padding: 12px;
+  border-radius: 10px;
+  border: 1px solid rgba(255, 255, 255, 0.1);
+  background: #000;
+  color: #fff;
+  font-size: 20px;
+  font-weight: 800;
+  box-sizing: border-box;
+  text-align: center;
+  outline: none;
+}
+
+.submit-btn {
+  background: #2ecc71;
+  color: #000;
+  border: none;
+  padding: 16px;
+  width: 100%;
+  border-radius: 16px;
+  font-weight: 900;
+  cursor: pointer;
+  font-size: 15px;
+  text-transform: uppercase;
+  letter-spacing: 1px;
+  transition: 0.3s;
+}
+
+.submit-btn:disabled {
+  opacity: 0.6;
+  cursor: not-allowed;
+}
+
+.ad-box {
+  margin-top: 15px;
+  font-size: 11px;
+  padding-top: 12px;
+  border-top: 1px solid rgba(255, 255, 255, 0.18);
+  color: rgba(255, 255, 255, 0.5);
+  line-height: 1.4;
+  text-align: center;
+}
+
+.loader {
+  border: 5px solid rgba(255, 255, 255, 0.1);
+  border-top: 5px solid #2ecc71;
+  border-radius: 50%;
+  width: 50px;
+  height: 50px;
+  animation: spin 1s linear infinite;
+  margin: 25px auto;
+}
+
+.status-text {
+  font-size: 22px;
+  font-weight: 800;
+  margin-bottom: 12px;
+  text-align: center;
+}
+
+.status-text.connected {
+  color: #2ecc71;
+}
+
+.sub-text {
+  opacity: 0.7;
+  font-size: 14px;
+  line-height: 1.5;
+  margin-bottom: 20px;
+  text-align: center;
+}
+
+.ad-container {
+  background: rgba(255, 255, 255, 0.05);
+  border-radius: 16px;
+  padding: 15px;
+  border: 1px dashed rgba(255, 255, 255, 0.2);
+  font-size: 13px;
+  text-align: center;
+}
+
+.ad-slide-active {
+  animation: fadeIn 0.5s;
 }
