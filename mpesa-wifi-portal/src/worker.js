@@ -97,7 +97,7 @@ export default {
         const gatewayHash = body.gateway_hash;
         if (!gatewayHash) return new Response("Missing gateway_hash", { status: 400 });
 
-      // Upsert gateway status with "Alive" response without touching payments
+        // Upsert gateway status with "Alive" response without touching payments
         await env.DB.prepare(`
           INSERT INTO gateway_status (gateway_hash, response, last_seen) 
           VALUES (?, 'Alive', CURRENT_TIMESTAMP)
@@ -145,7 +145,7 @@ export default {
     // --- 4. M-PESA STK PUSH (With Number Cleaning) ---
     if (url.pathname === "/initiate-stk") {
       const rawPhone = url.searchParams.get("phone");
-      const phone = cleanPhoneNumber(rawPhone); // Logic Change: Clean the number
+      const phone = cleanPhoneNumber(rawPhone);
       const mac = url.searchParams.get("mac");
       const pkgId = url.searchParams.get("pkg");
 
@@ -194,17 +194,26 @@ export default {
       }
     }
 
-    // --- 5. CALLBACK & OTHERS (UNCHANGED) ---
+    // --- 5. CALLBACK & OTHERS ---
     if (url.pathname === "/notif-cv") {
       const data = await request.json();
       const result = data.Body.stkCallback;
       if (result.ResultCode === 0) {
-        const payRow = await env.DB.prepare("SELECT mac_address FROM payments WHERE checkout_id = ?").bind(result.CheckoutRequestID).first();
-        const sessRow = await env.DB.prepare("SELECT id, token FROM client_sessions WHERE mac_address = ?").bind(payRow.mac_address).first();
-        if (sessRow) {
-          const rhid = await generateRhid(sessRow.token, env.FAS_KEY);
-          await env.DB.prepare("UPDATE client_sessions SET rhid = ? WHERE id = ?").bind(rhid, sessRow.id).run();
-          await env.DB.prepare("UPDATE payments SET status = 'PAID', session_id = ?, rhid = ? WHERE checkout_id = ?").bind(sessRow.id, rhid, result.CheckoutRequestID).run();
+        const payRow = await env.DB.prepare("SELECT mac_address, duration_minutes FROM payments WHERE checkout_id = ?").bind(result.CheckoutRequestID).first();
+        if (payRow) {
+          const sessRow = await env.DB.prepare("SELECT id, token FROM client_sessions WHERE mac_address = ?").bind(payRow.mac_address).first();
+          if (sessRow) {
+            const rhid = await generateRhid(sessRow.token, env.FAS_KEY);
+            await env.DB.prepare("UPDATE client_sessions SET rhid = ? WHERE id = ?").bind(rhid, sessRow.id).run();
+            await env.DB.prepare(`
+              UPDATE payments 
+              SET status = 'PAID', 
+                  session_id = ?, 
+                  rhid = ?, 
+                  session_expiry = datetime('now', '+' || ? || ' minutes') 
+              WHERE checkout_id = ?
+            `).bind(sessRow.id, rhid, payRow.duration_minutes, result.CheckoutRequestID).run();
+          }
         }
       } else {
         await env.DB.prepare("UPDATE payments SET status = 'FAILED' WHERE checkout_id = ?").bind(result.CheckoutRequestID).run();
@@ -223,10 +232,8 @@ export default {
   }
 };
 
-
 function generateLoginHTML(mac, pkgs) {
   const pkgElements = pkgs.map((p, idx) => {
-    // Convert kbps to Mbps for display (e.g., 5000 -> 5)
     const speedMbps = p.download_rate ? (p.download_rate / 1000).toFixed(0) : 'Max';
     
     return `
@@ -291,7 +298,6 @@ function generateLoginHTML(mac, pkgs) {
     .pkg-price { font-size: 18px; font-weight: 900; }
     .pkg-price::after { content: "/-"; font-size: 12px; margin-left: 1px; opacity: 0.6; }
     
-    /* New Speed Badge Style */
     .pkg-speed { 
       font-size: 9px; 
       background: var(--accent); 
