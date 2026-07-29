@@ -203,7 +203,13 @@ export default {
       const data = await request.json();
       const result = data.Body.stkCallback;
       if (result.ResultCode === 0) {
-        const payRow = await env.DB.prepare("SELECT mac_address, duration_minutes FROM payments WHERE checkout_id = ?").bind(result.CheckoutRequestID).first();
+        const payRow = await env.DB.prepare("SELECT status, mac_address, duration_minutes FROM payments WHERE checkout_id = ?").bind(result.CheckoutRequestID).first();
+        
+        // Idempotency check: Exit early if already paid
+        if (payRow && payRow.status === 'PAID') {
+          return new Response("OK");
+        }
+
         if (payRow) {
           const sessRow = await env.DB.prepare("SELECT id, token FROM client_sessions WHERE mac_address = ?").bind(payRow.mac_address).first();
           if (sessRow) {
