@@ -192,7 +192,7 @@ export default {
           ).bind(mData.CheckoutRequestID, phone, pkg.amount, mac, pkg.duration_hours * 60, gatewayHash).run();
           return Response.json({ success: true, checkout_id: mData.CheckoutRequestID }, { headers: corsHeaders });
         }
-        return Response.json({ success: false, error: "STK Push Failed" }, { status: 400, headers: corsHeaders });
+        return Response.json({ success: false, error: mData.errorMessage || mData.ResponseDescription || "STK Push Failed" }, { status: 400, headers: corsHeaders });
       } catch (e) {
         return Response.json({ success: false, error: e.message }, { status: 500, headers: corsHeaders });
       }
@@ -328,6 +328,15 @@ function generateLoginHTML(mac, pkgs) {
     }
     .btn:active { transform: scale(0.97); }
 
+    .error-msg {
+      color: #e74c3c;
+      font-size: 12px;
+      font-weight: 700;
+      margin-top: 10px;
+      text-align: center;
+      min-height: 16px;
+    }
+
     .ad-box { margin-top: 15px; font-size: 11px; padding-top: 12px; border-top: 1px solid var(--border); color: rgba(255,255,255,0.5); line-height: 1.4; text-align: center; }
   </style></head>
   <body>
@@ -341,6 +350,7 @@ function generateLoginHTML(mac, pkgs) {
         <input type="tel" id="phone" placeholder="0712 345 678" maxlength="12">
       </div>
       <button class="btn" id="payBtn" onclick="pay()">Secure Connect</button>
+      <div id="errorDisplay" class="error-msg"></div>
       <div class="ad-box">
         <strong>BHS CYBER SERVICES</strong><br>KRA, e-Citizen & Printing.
       </div>
@@ -359,15 +369,41 @@ function generateLoginHTML(mac, pkgs) {
         }
 
         const ph = document.getElementById('phone').value.trim();
-        if(ph.length < 10) return alert('Invalid phone number');
+        const errEl = document.getElementById('errorDisplay');
+        errEl.innerText = '';
+
+        if(ph.length < 10) {
+          errEl.innerText = 'Please enter a valid phone number';
+          return;
+        }
+        
         const btn = document.getElementById('payBtn');
         btn.disabled = true; btn.innerText = "Processing...";
+        
         try {
           const r = await fetch('/initiate-stk?phone='+encodeURIComponent(ph)+'&mac=${mac}&pkg='+selectedPkgId);
-          const d = await r.json();
-          if(d.success) window.location.href = '/waiting?id=' + d.checkout_id;
-          else { alert('Error: ' + d.error); btn.disabled = false; btn.innerText = "Secure Connect"; }
-        } catch(e) { alert('Network error.'); btn.disabled = false; btn.innerText = "Secure Connect"; }
+          
+          let d;
+          try {
+            d = await r.json();
+          } catch(parseErr) {
+            throw new Error('Invalid server response format.');
+          }
+
+          if(!r.ok) {
+            throw new Error(d.error || 'Server responded with an error status (' + r.status + ')');
+          }
+
+          if(d.success) {
+            window.location.href = '/waiting?id=' + d.checkout_id;
+          } else {
+            throw new Error(d.error || 'STK Push failed');
+          }
+        } catch(e) {
+          errEl.innerText = e.message || 'Network error occurred. Please try again.';
+          btn.disabled = false; 
+          btn.innerText = "Secure Connect";
+        }
       }
     </script>
   </body></html>`;
@@ -394,6 +430,7 @@ function generateWaitingHTML(id) {
     @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
     .status-text { font-size: 22px; font-weight: 800; margin-bottom: 12px; }
     .sub-text { opacity: 0.7; font-size: 14px; line-height: 1.5; margin-bottom: 20px; }
+    .error-box { color: #e74c3c; font-size: 13px; font-weight: 700; margin-top: 10px; display: none; }
     .ad-container { background: rgba(255,255,255,0.05); border-radius: 16px; padding: 15px; border: 1px dashed rgba(255,255,255,0.2); font-size: 13px; }
     .ad-slide { display: none; }
     .ad-slide.active { display: block; animation: fadeIn 0.5s; }
@@ -404,6 +441,7 @@ function generateWaitingHTML(id) {
       <div id="loader" class="loader"></div>
       <div class="status-text" id="msg">Verifying Payment</div>
       <p class="sub-text" id="submsg">Enter your M-Pesa PIN on your phone to complete connection.</p>
+      <div id="errorBox" class="error-box"></div>
       <div class="ad-container">
         <div class="ad-slide active"><strong>Fast Printing</strong><br>Color prints available now.</div>
         <div class="ad-slide"><strong>Cyber Services</strong><br>KRA & e-Citizen services.</div>
@@ -422,10 +460,18 @@ function generateWaitingHTML(id) {
       let cur = 0; const ads = document.querySelectorAll('.ad-slide');
       setInterval(() => { ads[cur].classList.remove('active'); cur = (cur+1)%ads.length; ads[cur].classList.add('active'); }, 3000);
       
+      let consecutiveErrors = 0;
+      const maxErrors = 5;
+
       const poll = setInterval(async () => {
         try {
           const r = await fetch('/status?id=${id}');
+          if (!r.ok) {
+            throw new Error('Status check failed');
+          }
           const d = await r.json();
+          consecutiveErrors = 0; // reset on success
+
           if (d.status === 'PAID' && d.processed === 1) {
             clearInterval(poll);
             document.getElementById('msg').innerText = "Connected!";
@@ -436,8 +482,24 @@ function generateWaitingHTML(id) {
             speakSuccess();
             
             setTimeout(() => window.location.href = "http://connectivitycheck.gstatic.com/generate_204", 2500);
+          } else if (d.status === 'FAILED') {
+            clearInterval(poll);
+            document.getElementById('msg').innerText = "Payment Failed";
+            document.getElementById('msg').style.color = "#e74c3c";
+            document.getElementById('loader').style.display = "none";
+            document.getElementById('submsg').innerText = "The transaction was cancelled or failed.";
           }
-        } catch(e) {}
+        } catch(e) {
+          consecutiveErrors++;
+          if (consecutiveErrors >= maxErrors) {
+            clearInterval(poll);
+            document.getElementById('loader').style.display = "none";
+            document.getElementById('submsg').style.display = "none";
+            const errBox = document.getElementById('errorBox');
+            errBox.innerText = "Connection lost while checking status. Please refresh or reconnect.";
+            errBox.style.display = "block";
+          }
+        }
       }, 2500);
     </script>
   </body></html>`;
