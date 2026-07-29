@@ -97,13 +97,13 @@ export default {
         const gatewayHash = body.gateway_hash;
         if (!gatewayHash) return new Response("Missing gateway_hash", { status: 400 });
 
+      // Upsert gateway status with "Alive" response without touching payments
         await env.DB.prepare(`
-          UPDATE payments 
-          SET duration_minutes = MAX(0, duration_minutes - 2) 
-          WHERE gateway_hash = ? 
-            AND status = 'PAID' 
-            AND processed = 1 
-            AND duration_minutes > 0
+          INSERT INTO gateway_status (gateway_hash, response, last_seen) 
+          VALUES (?, 'Alive', CURRENT_TIMESTAMP)
+          ON CONFLICT(gateway_hash) DO UPDATE SET 
+            response = 'Alive',
+            last_seen = CURRENT_TIMESTAMP
         `).bind(gatewayHash).run();
 
         return Response.json({ success: true }, { headers: corsHeaders });

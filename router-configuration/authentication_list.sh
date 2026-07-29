@@ -10,7 +10,7 @@ HEARTBEAT_URL="${BASE_URL}/heartbeat"
 
 RELOAD_THRESHOLD=120
 COUNTER=0
-HEARTBEAT_THRESHOLD=4 
+HEARTBEAT_THRESHOLD=20 
 HB_COUNTER=0
 
 logger -t auth_poller "Birir WiFi Poller: Starting V4.0 (Rate Limit Support)..."
