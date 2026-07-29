@@ -47,48 +47,52 @@ export default {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-    // --- 1. AUTHMON POLLING ---
-    const authGet = url.searchParams.get("auth_get");
-    if (authGet !== null) {
-      const payload = url.searchParams.get("payload") || "";
-      const isRecovery = url.searchParams.get("recovery") === "true"; 
-      const gateway = url.searchParams.get("gateway") || "bhscyber"; 
+      // --- 1. AUTHMON POLLING ---
+      const authGet = url.searchParams.get("auth_get");
+      if (authGet !== null) {
+        const payload = url.searchParams.get("payload") || "";
+        const isRecovery = url.searchParams.get("recovery") === "true"; 
+        const gateway = url.searchParams.get("gateway") || "bhscyber"; 
 
-      if (payload.startsWith("*") && payload.length > 1) {
-        const tokensToAck = payload.replace(/\*/g, "").trim().split(/\s+/).filter(t => t.length > 0);
-        if (tokensToAck.length > 0) {
-          for (const token of tokensToAck) {
-            await env.DB.prepare(`UPDATE payments SET processed = 1 WHERE rhid = ? AND status = 'PAID'`).bind(token).run();
+        if (payload.startsWith("*") && payload.length > 1) {
+          const tokensToAck = payload.replace(/\*/g, "").trim().split(/\s+/).filter(t => t.length > 0);
+          if (tokensToAck.length > 0) {
+            for (const token of tokensToAck) {
+              await env.DB.prepare(`UPDATE payments SET processed = 1 WHERE rhid = ? AND status = 'PAID'`).bind(token).run();
+            }
           }
+          return new Response("ACK_OK\n", { headers: { "Content-Type": "text/plain" } });
         }
-        return new Response("ACK_OK\n", { headers: { "Content-Type": "text/plain" } });
+
+        // Dynamic remaining minutes calculation using session_expiry
+        const timeRemainingExpr = `CAST(ROUND((julianday(p.session_expiry) - julianday('now')) * 1440) AS INTEGER)`;
+
+        const query = isRecovery 
+          ? `SELECT p.rhid, ${timeRemainingExpr} AS duration_minutes, p.mac_address, pkg.upload_rate, pkg.download_rate 
+             FROM payments p
+             LEFT JOIN packages pkg ON p.amount = pkg.amount
+             WHERE p.status = 'PAID' AND p.session_expiry > datetime('now') AND p.gateway_hash = ? AND p.rhid IS NOT NULL`
+          : `SELECT p.rhid, ${timeRemainingExpr} AS duration_minutes, p.mac_address, pkg.upload_rate, pkg.download_rate 
+             FROM payments p
+             LEFT JOIN packages pkg ON p.amount = pkg.amount
+             WHERE p.status = 'PAID' AND p.processed = 0 AND p.session_expiry > datetime('now') AND p.gateway_hash = ? AND p.rhid IS NOT NULL`;
+
+        const { results } = await env.DB.prepare(query).bind(gateway).all();
+
+        if (results && results.length > 0) {
+          // format: * [rhid] [remaining_minutes] [up_kbps] [down_kbps] [up_quota] [down_quota] [mac]
+          const authList = results.map((r) => {
+            const up = r.upload_rate || 0;
+            const down = r.download_rate || 0;
+            // Ensure minutes never drops below 1 if session is still valid
+            const mins = Math.max(1, r.duration_minutes || 1);
+            return `* ${r.rhid} ${mins} ${up} ${down} 0 0 ${r.mac_address}`;
+          }).join("\n");
+          
+          return new Response(authList + "\n", { headers: { "Content-Type": "text/plain" } });
+        }
+        return new Response("*\n", { headers: { "Content-Type": "text/plain" } });
       }
-
-      // Logic: Join payments (p) with packages (pkg) using the amount as the link
-      const query = isRecovery 
-        ? `SELECT p.rhid, p.duration_minutes, p.mac_address, pkg.upload_rate, pkg.download_rate 
-           FROM payments p
-           LEFT JOIN packages pkg ON p.amount = pkg.amount
-           WHERE p.status = 'PAID' AND p.duration_minutes > 0 AND p.gateway_hash = ? AND p.rhid IS NOT NULL`
-        : `SELECT p.rhid, p.duration_minutes, p.mac_address, pkg.upload_rate, pkg.download_rate 
-           FROM payments p
-           LEFT JOIN packages pkg ON p.amount = pkg.amount
-           WHERE p.status = 'PAID' AND p.processed = 0 AND p.duration_minutes > 0 AND p.gateway_hash = ? AND p.rhid IS NOT NULL`;
-
-      const { results } = await env.DB.prepare(query).bind(gateway).all();
-
-      if (results && results.length > 0) {
-        // format: * [rhid] [minutes] [up_kbps] [down_kbps] [up_quota] [down_quota] [mac]
-        const authList = results.map((r) => {
-          const up = r.upload_rate || 0;
-          const down = r.download_rate || 0;
-          return `* ${r.rhid} ${r.duration_minutes} ${up} ${down} 0 0 ${r.mac_address}`;
-        }).join("\n");
-        
-        return new Response(authList + "\n", { headers: { "Content-Type": "text/plain" } });
-      }
-      return new Response("*\n", { headers: { "Content-Type": "text/plain" } });
-    }
 
     // --- 2. HEARTBEAT ENDPOINT ---
     if (url.pathname === "/heartbeat" && request.method === "POST") {
