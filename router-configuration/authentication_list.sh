@@ -1,32 +1,30 @@
+cat << 'EOF' > /usr/bin/authentication_list.sh
 #!/bin/sh
 
-# File location /usr/bin/authentication_list.sh
-
-# --- Configuration ---
 GATEWAY="bhscyber"
 BASE_URL="https://mpesa-wifi-portal.prodigy4614.workers.dev"
 POLL_URL="${BASE_URL}/login?auth_get=view&gateway=${GATEWAY}"
-HEARTBEAT_URL="${BASE_URL}/heartbeat"
+CACHE_FILE="/tmp/active_sessions.txt"
 
 RELOAD_THRESHOLD=120
 COUNTER=0
-HEARTBEAT_THRESHOLD=20 
-HB_COUNTER=0
+CACHE_COUNTER=0
+CACHE_REFRESH_CYCLES=30 # Refresh local cache every ~5 minutes (30 * 10s)
 
-logger -t auth_poller "Birir WiFi Poller: Starting V4.0 (Rate Limit Support)..."
+logger -t auth_poller "Birir WiFi Poller: Starting V4.3 (Cached Local Recovery)..."
 
-# --- 1. WAIT FOR SERVICES ---
 while ! pgrep opennds >/dev/null; do sleep 5; done
 sleep 5
 
-# --- FUNCTION: RECOVER SESSIONS ---
-recover_sessions() {
-    RECOVERY_DATA=$(uclient-fetch -q -T 15 -O - "${POLL_URL}&recovery=true" 2>/dev/null)
-    
-    if [ -n "$RECOVERY_DATA" ] && [ "$RECOVERY_DATA" != "*" ]; then
-        echo "$RECOVERY_DATA" | while read -r line; do
+fetch_and_cache_sessions() {
+    logger -t auth_poller "Refreshing local session cache from Worker..."
+    uclient-fetch -q -T 5 -O "$CACHE_FILE" "${POLL_URL}&recovery=true" 2>/dev/null
+}
+
+process_recovery_cache() {
+    if [ -f "$CACHE_FILE" ]; then
+        cat "$CACHE_FILE" | while read -r line; do
             if [ "$(echo "$line" | cut -c1)" = "*" ]; then
-                # Extraction: $3=mins, $4=up, $5=down, $8=mac
                 MINS=$(echo "$line" | awk '{print $3}')
                 UP=$(echo "$line" | awk '{print $4}')
                 DOWN=$(echo "$line" | awk '{print $5}')
@@ -36,7 +34,7 @@ recover_sessions() {
                     CLIENT_INFO=$(ndsctl json "$MAC" 2>/dev/null)
                     if echo "$CLIENT_INFO" | grep -q "$MAC"; then
                         if ! echo "$CLIENT_INFO" | grep -qi "\"state\":\"authenticated\""; then
-                            logger -t auth_poller "RECONNECT: $MAC (Speed: $UP/$DOWN). Restoring $MINS mins."
+                            logger -t auth_poller "CACHED RECONNECT: $MAC (Speed: $UP/$DOWN). Restoring $MINS mins."
                             ndsctl auth "$MAC" "$MINS" "$UP" "$DOWN" 0 0 >/dev/null 2>&1
                         fi
                     fi
@@ -46,30 +44,30 @@ recover_sessions() {
     fi
 }
 
-# --- MAIN LOOP ---
-while true; do
-    # 2. HEARTBEAT
-    HB_COUNTER=$((HB_COUNTER + 1))
-    if [ "$HB_COUNTER" -ge "$HEARTBEAT_THRESHOLD" ]; then
-        uclient-fetch -q -T 10 --post-data="{\"gateway_hash\": \"$GATEWAY\"}" \
-            --header="Content-Type: application/json" -O - "$HEARTBEAT_URL" > /dev/null 2>&1
-        HB_COUNTER=0
-    fi
+# Initial fetch to populate local cache on startup
+fetch_and_cache_sessions
 
-    # 3. HOURLY MAINTENANCE
-    # Restart opennds every hour to keep it from failing/crashing
+while true; do
     COUNTER=$((COUNTER + 1))
+    CACHE_COUNTER=$((CACHE_COUNTER + 1))
+
     if [ "$COUNTER" -ge "$RELOAD_THRESHOLD" ]; then
         /etc/init.d/opennds restart
         sleep 10
         COUNTER=0
     fi
 
-    # 4. RECOVERY
-    recover_sessions
+    # Periodically refresh the local cache file from the server
+    if [ "$CACHE_COUNTER" -ge "$CACHE_REFRESH_CYCLES" ]; then
+        fetch_and_cache_sessions
+        CACHE_COUNTER=0
+    fi
 
-    # 5. NEW PAYMENTS
-    RAW_DATA=$(uclient-fetch -q -T 10 -O - "$POLL_URL" 2>/dev/null)
+    # Process session recovery locally using the cached file
+    process_recovery_cache
+
+    # Poll for real-time new payments
+    RAW_DATA=$(uclient-fetch -q -T 5 -O - "$POLL_URL" 2>/dev/null)
     if [ -n "$RAW_DATA" ] && [ "$RAW_DATA" != "*" ]; then
         echo "$RAW_DATA" | while read -r line; do
             if [ "$(echo "$line" | cut -c1)" = "*" ]; then
@@ -91,5 +89,7 @@ while true; do
             fi
         done
     fi
-    sleep 30
+    sleep 10
 done
+EOF
+chmod +x /usr/bin/authentication_list.sh

@@ -94,28 +94,6 @@ export default {
         return new Response("*\n", { headers: { "Content-Type": "text/plain" } });
       }
 
-    // --- 2. HEARTBEAT ENDPOINT ---
-    if (url.pathname === "/heartbeat" && request.method === "POST") {
-      try {
-        const body = await request.json();
-        const gatewayHash = body.gateway_hash;
-        if (!gatewayHash) return new Response("Missing gateway_hash", { status: 400 });
-
-        // Upsert gateway status with "Alive" response without touching payments
-        await env.DB.prepare(`
-          INSERT INTO gateway_status (gateway_hash, response, last_seen) 
-          VALUES (?, 'Alive', CURRENT_TIMESTAMP)
-          ON CONFLICT(gateway_hash) DO UPDATE SET 
-            response = 'Alive',
-            last_seen = CURRENT_TIMESTAMP
-        `).bind(gatewayHash).run();
-
-        return Response.json({ success: true }, { headers: corsHeaders });
-      } catch (e) {
-        return new Response("Heartbeat Error", { status: 500 });
-      }
-    }
-
     // --- 3. FAS HANDSHAKE ---
     const fasBlob = url.searchParams.get("fas");
     if (fasBlob) {
