@@ -61,15 +61,6 @@ export default {
         return new Response("ACK_OK\n", { headers: { "Content-Type": "text/plain" } });
       }
 
-      // Cleanup step: Zero out duration_minutes for expired paid sessions
-      await env.DB.prepare(`
-        UPDATE payments 
-        SET duration_minutes = 0 
-        WHERE status = 'PAID' 
-          AND session_expiry <= datetime('now') 
-          AND duration_minutes != 0
-      `).run();
-
       const timeRemainingExpr = `CAST(ROUND((julianday(p.session_expiry) - julianday('now')) * 1440) AS INTEGER)`;
 
       const query = isRecovery 
