@@ -33,6 +33,23 @@ async function generateRhid(token, faskey) {
     .toLowerCase();
 }
 
+/**
+ * Helper to clean up expired sessions off the hot path
+ */
+async function cleanupExpiredSessions(db) {
+  try {
+    await db.prepare(`
+      UPDATE payments 
+      SET duration_minutes = 0 
+      WHERE status = 'PAID' 
+        AND session_expiry <= datetime('now') 
+        AND duration_minutes != 0
+    `).run();
+  } catch (e) {
+    console.error("Cleanup error:", e);
+  }
+}
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -40,114 +57,208 @@ const corsHeaders = {
 };
 
 export default {
-  async fetch(request, env) {
+  // Scheduled trigger execution (if configured in wrangler.toml cron)
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(cleanupExpiredSessions(env.DB));
+  },
+
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-    // --- 1. AUTHMON POLLING ---
-    const authGet = url.searchParams.get("auth_get");
-    if (authGet !== null) {
-      const payload = url.searchParams.get("payload") || "";
-      const isRecovery = url.searchParams.get("recovery") === "true"; 
-      const gateway = url.searchParams.get("gateway") || "bhscyber"; 
+// Helper to format auth entry with dynamically computed remaining time
+function formatAuthEntry(r) {
+  const up = r.upload_rate || 0;
+  const down = r.download_rate || 0;
+  
+  // Calculate remaining minutes dynamically from the expiry timestamp
+  const nowMs = Date.now();
+  const expiryMs = r.expiry_ms || nowMs;
+  const remainingMins = Math.max(1, Math.round((expiryMs - nowMs) / 60000));
 
-      if (payload.startsWith("*") && payload.length > 1) {
-        const tokensToAck = payload.replace(/\*/g, "").trim().split(/\s+/).filter(t => t.length > 0);
-        if (tokensToAck.length > 0) {
-          for (const token of tokensToAck) {
-            await env.DB.prepare(`UPDATE payments SET processed = 1 WHERE rhid = ? AND status = 'PAID'`).bind(token).run();
-          }
-        }
-        return new Response("ACK_OK\n", { headers: { "Content-Type": "text/plain" } });
+  const ip = r.client_ip || "0.0.0.0";
+  return `* ${r.rhid} ${remainingMins} ${up} ${down} 0 0 ${r.mac_address} ${ip}`;
+}
+
+// Helper to rebuild/cache JSON arrays in KV
+async function getCachedAuthList(env, gateway, isRecovery) {
+  const kvKey = isRecovery ? `auth_recovery:${gateway}` : `auth_pending:${gateway}`;
+  
+  // 1. Try reading JSON structure directly from Cloudflare KV (0 D1 Reads)
+  const cachedDataStr = await env.KV.get(kvKey);
+  let activeClients = [];
+
+  if (cachedDataStr !== null) {
+    activeClients = JSON.parse(cachedDataStr);
+  } else {
+    // 2. Fallback to D1 database if KV misses or is invalidated
+    // Store exact Unix timestamp (in ms) for precise expiry calculations in KV
+    const query = isRecovery 
+      ? `SELECT p.rhid, CAST((julianday(p.session_expiry) - 2440587.5) * 86400000 AS INTEGER) AS expiry_ms, 
+                p.mac_address, s.client_ip, pkg.upload_rate, pkg.download_rate 
+         FROM payments p
+         LEFT JOIN client_sessions s ON p.mac_address = s.mac_address
+         LEFT JOIN packages pkg ON p.amount = pkg.amount
+         WHERE p.status = 'PAID' AND p.session_expiry > datetime('now') AND p.gateway_hash = ? AND p.rhid IS NOT NULL`
+      : `SELECT p.rhid, CAST((julianday(p.session_expiry) - 2440587.5) * 86400000 AS INTEGER) AS expiry_ms, 
+                p.mac_address, s.client_ip, pkg.upload_rate, pkg.download_rate 
+         FROM payments p
+         LEFT JOIN client_sessions s ON p.mac_address = s.mac_address
+         LEFT JOIN packages pkg ON p.amount = pkg.amount
+         WHERE p.status = 'PAID' AND p.processed = 0 AND p.session_expiry > datetime('now') AND p.gateway_hash = ? AND p.rhid IS NOT NULL`;
+
+    const { results } = await env.DB.prepare(query).bind(gateway).all();
+    activeClients = results || [];
+
+    // Cache as JSON string with longer TTL (e.g., 30 minutes)
+    // On-the-fly math handles remaining time; triggerAuthmonUpdate handles cache invalidation
+    await env.KV.put(kvKey, JSON.stringify(activeClients), { expirationTtl: 1800 });
+  }
+
+  // 3. Filter out expired clients in-memory & format response string
+  const nowMs = Date.now();
+  const validClients = activeClients.filter(r => r.expiry_ms > nowMs);
+
+  if (validClients.length > 0) {
+    return validClients.map(formatAuthEntry).join("\n") + "\n";
+  }
+
+  return "*\n";
+}
+
+// --- 1. AUTHMON POLLING ---
+const authGet = url.searchParams.get("auth_get");
+if (authGet !== null) {
+  const payload = url.searchParams.get("payload") || "";
+  const isRecovery = url.searchParams.get("recovery") === "true"; 
+  const gateway = url.searchParams.get("gateway") || "bhscyber"; 
+
+  // Handle Token Acknowledgements from openNDS
+  if (payload.startsWith("*") && payload.length > 1) {
+    const tokensToAck = payload.replace(/\*/g, "").trim().split(/\s+/).filter(t => t.length > 0);
+    if (tokensToAck.length > 0) {
+      for (const token of tokensToAck) {
+        await env.DB.prepare(`UPDATE payments SET processed = 1 WHERE rhid = ? AND status = 'PAID'`).bind(token).run();
       }
+      // Invalidate both lists when tokens are acknowledged
+      await env.KV.delete(`auth_pending:${gateway}`);
+      await env.KV.delete(`auth_recovery:${gateway}`);
+    }
+    
+    // Offload expired session cleanup
+    if (ctx && ctx.waitUntil) {
+      ctx.waitUntil(cleanupExpiredSessions(env.DB));
+    }
+    return new Response("ACK_OK\n", { headers: { "Content-Type": "text/plain" } });
+  }
 
-      // Cleanup step: Zero out duration_minutes for expired paid sessions
+  // Serve directly from KV
+  const responseText = await getCachedAuthList(env, gateway, isRecovery);
+  return new Response(responseText, { headers: { "Content-Type": "text/plain" } });
+}
+
+    // Helper to fetch packages from KV with a 6-hour (21600s) TTL before falling back to D1
+async function getCachedPackages(env) {
+  const kvKey = "packages_list";
+
+  // 1. Read directly from KV (0 D1 Reads for 6 hours)
+  const cachedDataStr = await env.KV.get(kvKey);
+  if (cachedDataStr !== null) {
+    return JSON.parse(cachedDataStr);
+  }
+
+  // 2. Cache miss or expired (>6h): Query D1 database
+  const { results: pkgs } = await env.DB.prepare(
+    "SELECT * FROM packages ORDER BY amount ASC"
+  ).all();
+
+  const packagesList = pkgs || [];
+
+  // 3. Store in KV with a strict 6-hour Time-To-Live (TTL)
+  // 21,600 seconds = 6 hours
+  await env.KV.put(kvKey, JSON.stringify(packagesList), { expirationTtl: 21600 });
+
+  return packagesList;
+}
+
+// --- 2. FAS HANDSHAKE ---
+const fasBlob = url.searchParams.get("fas");
+if (fasBlob) {
+  try {
+    const decoded = atob(fasBlob.replace(/ /g, "+").replace(/-/g, "+").replace(/_/g, "/"));
+    const params = new URLSearchParams(decoded.replace(/, /g, "&"));
+    const clientmac = params.get("clientmac") || "";
+    const token = params.get("hid") || "";
+    const gatewayHash = params.get("gatewayname") || "";
+    const clientip = params.get("clientip") || "";
+    const clientif = params.get("clientif") || "";
+
+    // Read packages directly from KV (refreshes from D1 automatically every 6 hours)
+    const pkgs = await getCachedPackages(env);
+
+   if (clientmac) {
       await env.DB.prepare(`
-        UPDATE payments 
-        SET duration_minutes = 0 
-        WHERE status = 'PAID' 
-          AND session_expiry <= datetime('now') 
-          AND duration_minutes != 0
-      `).run();
+        INSERT INTO client_sessions (mac_address, token, gateway_hash, client_ip, client_if) 
+        VALUES (?, ?, ?, ?, ?)
+        ON CONFLICT(mac_address) DO UPDATE SET 
+          token = excluded.token, 
+          gateway_hash = excluded.gateway_hash,
+          client_ip = excluded.client_ip,
+          client_if = excluded.client_if,
+          created_at = CURRENT_TIMESTAMP
+      `).bind(clientmac, token, gatewayHash, clientip, clientif).run();
 
-      const timeRemainingExpr = `CAST(ROUND((julianday(p.session_expiry) - julianday('now')) * 1440) AS INTEGER)`;
-
-      const query = isRecovery 
-        ? `SELECT p.rhid, ${timeRemainingExpr} AS duration_minutes, p.mac_address, s.client_ip, pkg.upload_rate, pkg.download_rate 
-           FROM payments p
-           LEFT JOIN client_sessions s ON p.mac_address = s.mac_address
-           LEFT JOIN packages pkg ON p.amount = pkg.amount
-           WHERE p.status = 'PAID' AND p.session_expiry > datetime('now') AND p.gateway_hash = ? AND p.rhid IS NOT NULL`
-        : `SELECT p.rhid, ${timeRemainingExpr} AS duration_minutes, p.mac_address, s.client_ip, pkg.upload_rate, pkg.download_rate 
-           FROM payments p
-           LEFT JOIN client_sessions s ON p.mac_address = s.mac_address
-           LEFT JOIN packages pkg ON p.amount = pkg.amount
-           WHERE p.status = 'PAID' AND p.processed = 0 AND p.session_expiry > datetime('now') AND p.gateway_hash = ? AND p.rhid IS NOT NULL`;
-
-      const { results } = await env.DB.prepare(query).bind(gateway).all();
-
-      if (results && results.length > 0) {
-        const authList = results.map((r) => {
-          const up = r.upload_rate || 0;
-          const down = r.download_rate || 0;
-          const mins = Math.max(1, r.duration_minutes || 1);
-          const ip = r.client_ip || "0.0.0.0";
-          return `* ${r.rhid} ${mins} ${up} ${down} 0 0 ${r.mac_address} ${ip}`;
-        }).join("\n");
-
-        return new Response(authList + "\n", { headers: { "Content-Type": "text/plain" } });
-      }
-      return new Response("*\n", { headers: { "Content-Type": "text/plain" } });
+      // FIX: Mirror session data to KV so /initiate-stk hits cache
+      await env.KV.put(
+        `session:${clientmac}`, 
+        JSON.stringify({ gateway_hash: gatewayHash, token: token }), 
+        { expirationTtl: 120} // 2 minutes TTL
+      );
     }
 
-    // --- 2. FAS HANDSHAKE ---
-    const fasBlob = url.searchParams.get("fas");
-    if (fasBlob) {
-      try {
-        const decoded = atob(fasBlob.replace(/ /g, "+").replace(/-/g, "+").replace(/_/g, "/"));
-        const params = new URLSearchParams(decoded.replace(/, /g, "&"));
-        const clientmac = params.get("clientmac") || "";
-        const token = params.get("hid") || "";
-        const gatewayHash = params.get("gatewayname") || "";
-        const clientip = params.get("clientip") || "";
-        const clientif = params.get("clientif") || "";
+    return new Response(generateLoginHTML(clientmac, clientip, pkgs), { 
+      headers: { "Content-Type": "text/html; charset=utf-8" } 
+    });
+  } catch (e) {
+    return new Response("FAS Error", { status: 400 });
+  }
+}
 
-        const { results: pkgs } = await env.DB.prepare("SELECT * FROM packages ORDER BY amount ASC").all();
-
-        if (clientmac) {
-          await env.DB.prepare(`
-            INSERT INTO client_sessions (mac_address, token, gateway_hash, client_ip, client_if) 
-            VALUES (?, ?, ?, ?, ?)
-            ON CONFLICT(mac_address) DO UPDATE SET 
-              token = excluded.token, 
-              gateway_hash = excluded.gateway_hash,
-              client_ip = excluded.client_ip,
-              client_if = excluded.client_if,
-              created_at = CURRENT_TIMESTAMP
-          `).bind(clientmac, token, gatewayHash, clientip, clientif).run();
-        }
-
-        return new Response(generateLoginHTML(clientmac, clientip, pkgs), { headers: { "Content-Type": "text/html; charset=utf-8" } });
-      } catch (e) {
-        return new Response("FAS Error", { status: 400 });
-      }
-    }
-
-    // --- 3. M-PESA STK PUSH ---
+// --- 3. M-PESA STK PUSH ---
     if (url.pathname === "/initiate-stk") {
       const rawPhone = url.searchParams.get("phone");
       const phone = cleanPhoneNumber(rawPhone);
       const mac = url.searchParams.get("mac");
       const pkgId = url.searchParams.get("pkg");
 
-      const pkg = await env.DB.prepare("SELECT * FROM packages WHERE id = ?").bind(pkgId).first();
+      // 1. KV READ FOR PACKAGE (Fallback to D1 source of truth)
+      let pkg = null;
+      const cachedPackagesStr = await env.KV.get("packages_list");
+      if (cachedPackagesStr !== null) {
+        const pkgs = JSON.parse(cachedPackagesStr);
+        pkg = pkgs.find(p => String(p.id) === String(pkgId)) || null;
+      }
+      
+      if (!pkg) {
+        pkg = await env.DB.prepare("SELECT * FROM packages WHERE id = ?").bind(pkgId).first();
+      }
 
       if (!pkg) {
         return Response.json({ success: false, error: "Invalid package" }, { status: 400, headers: corsHeaders });
       }
 
-      const session = await env.DB.prepare("SELECT gateway_hash FROM client_sessions WHERE mac_address = ?").bind(mac).first();
-      const gatewayHash = session ? session.gateway_hash : "";
+      // 2. KV READ FOR SESSION (Fallback to D1 source of truth)
+      let gatewayHash = "";
+      if (mac) {
+        const cachedSessionStr = await env.KV.get(`session:${mac}`);
+        if (cachedSessionStr !== null) {
+          const sessionObj = JSON.parse(cachedSessionStr);
+          gatewayHash = sessionObj.gateway_hash || "";
+        } else {
+          const session = await env.DB.prepare("SELECT gateway_hash FROM client_sessions WHERE mac_address = ?").bind(mac).first();
+          gatewayHash = session ? session.gateway_hash : "";
+        }
+      }
 
       try {
         const accessToken = await getAccessToken(env);
@@ -186,21 +297,32 @@ export default {
     }
 
     // --- 4. CALLBACK & STATUS ---
+
     if (url.pathname === "/notif-cv") {
       const data = await request.json();
       const result = data.Body.stkCallback;
+
       if (result.ResultCode === 0) {
-        const payRow = await env.DB.prepare("SELECT status, mac_address, duration_minutes FROM payments WHERE checkout_id = ?").bind(result.CheckoutRequestID).first();
+        const payRow = await env.DB.prepare(
+          "SELECT status, mac_address, duration_minutes, gateway_hash FROM payments WHERE checkout_id = ?"
+        ).bind(result.CheckoutRequestID).first();
 
         if (payRow && payRow.status === 'PAID') {
           return new Response("OK");
         }
 
         if (payRow) {
-          const sessRow = await env.DB.prepare("SELECT id, token FROM client_sessions WHERE mac_address = ?").bind(payRow.mac_address).first();
+          const sessRow = await env.DB.prepare(
+            "SELECT id, token FROM client_sessions WHERE mac_address = ?"
+          ).bind(payRow.mac_address).first();
+
           if (sessRow) {
             const rhid = await generateRhid(sessRow.token, env.FAS_KEY);
-            await env.DB.prepare("UPDATE client_sessions SET rhid = ? WHERE id = ?").bind(rhid, sessRow.id).run();
+
+            // Update D1 (Source of Truth)
+            await env.DB.prepare("UPDATE client_sessions SET rhid = ? WHERE id = ?")
+              .bind(rhid, sessRow.id).run();
+
             await env.DB.prepare(`
               UPDATE payments 
               SET status = 'PAID', 
@@ -209,16 +331,55 @@ export default {
                   session_expiry = datetime('now', '+' || ? || ' minutes') 
               WHERE checkout_id = ?
             `).bind(sessRow.id, rhid, payRow.duration_minutes, result.CheckoutRequestID).run();
+
+            // -------------------------------------------------------------
+            // EXTEND KV SESSION TTL TO MATCH PACKAGE DURATION
+            // -------------------------------------------------------------
+            const packageTtlSeconds = Math.max(payRow.duration_minutes * 60, 60); // Minimum 60s rule for KV
+            
+            const updatedSessionData = {
+              gateway_hash: payRow.gateway_hash || "",
+              token: sessRow.token,
+              rhid: rhid,
+              status: "ACTIVE",
+              expires_at: Date.now() + (packageTtlSeconds * 1000)
+            };
+
+            await env.KV.put(
+              `session:${payRow.mac_address}`, 
+              JSON.stringify(updatedSessionData), 
+              { expirationTtl: packageTtlSeconds }
+            );
+
+            // Invalidate router polling cache
+            const gateway = payRow.gateway_hash || "bhscyber";
+            if (ctx && ctx.waitUntil) {
+              ctx.waitUntil(triggerAuthmonUpdate(env, gateway));
+            } else {
+              await triggerAuthmonUpdate(env, gateway);
+            }
           }
         }
       } else {
-        await env.DB.prepare("UPDATE payments SET status = 'FAILED' WHERE checkout_id = ?").bind(result.CheckoutRequestID).run();
+        await env.DB.prepare("UPDATE payments SET status = 'FAILED' WHERE checkout_id = ?")
+          .bind(result.CheckoutRequestID).run();
       }
+
       return new Response("OK");
     }
 
+    // Helper to invalidate KV cache
+    async function triggerAuthmonUpdate(env, gateway) {
+      await env.KV.delete(`auth_pending:${gateway}`);
+      await env.KV.delete(`auth_recovery:${gateway}`);
+    }
+
     if (url.pathname === "/status") {
-      const row = await env.DB.prepare("SELECT status, processed FROM payments WHERE checkout_id = ?").bind(url.searchParams.get("id")).first();
+      const checkoutId = url.searchParams.get("id");
+      if (!checkoutId) {
+        return Response.json({ status: "NOT_FOUND" }, { headers: corsHeaders });
+      }
+      const row = await env.DB.prepare("SELECT status, processed FROM payments WHERE checkout_id = ?").bind(checkoutId).first();
       return Response.json(row || { status: "NOT_FOUND" }, { headers: corsHeaders });
     }
 
@@ -350,7 +511,6 @@ function generateLoginHTML(mac, clientip, pkgs) {
       const clientIp = '${clientip}';
 
       window.addEventListener('DOMContentLoaded', () => {
-        // Save IP to localStorage and display it
         if (clientIp) {
           localStorage.setItem('bhs_client_ip', clientIp);
           document.getElementById('clientIpText').innerText = clientIp;
@@ -478,8 +638,21 @@ function generateWaitingHTML(id) {
 
       let consecutiveErrors = 0;
       const maxErrors = 5;
+      let pollCount = 0;
+      const maxPolls = 48; // Stop polling after 2 minutes (48 * 2.5s) to save DB reads
 
       const poll = setInterval(async () => {
+        pollCount++;
+        if (pollCount > maxPolls) {
+          clearInterval(poll);
+          document.getElementById('loader').style.display = "none";
+          document.getElementById('submsg').style.display = "none";
+          const errBox = document.getElementById('errorBox');
+          errBox.innerText = "Payment verification timed out. If you paid, please refresh the page.";
+          errBox.style.display = "block";
+          return;
+        }
+
         try {
           const r = await fetch('/status?id=${id}');
           if (!r.ok) {

@@ -33,6 +33,23 @@ async function generateRhid(token, faskey) {
     .toLowerCase();
 }
 
+/**
+ * Helper to clean up expired sessions off the hot path
+ */
+async function cleanupExpiredSessions(db) {
+  try {
+    await db.prepare(`
+      UPDATE payments 
+      SET duration_minutes = 0 
+      WHERE status = 'PAID' 
+        AND session_expiry <= datetime('now') 
+        AND duration_minutes != 0
+    `).run();
+  } catch (e) {
+    console.error("Cleanup error:", e);
+  }
+}
+
 const corsHeaders = {
   "Access-Control-Allow-Origin": "*",
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
@@ -40,7 +57,12 @@ const corsHeaders = {
 };
 
 export default {
-  async fetch(request, env) {
+  // Scheduled trigger execution (if configured in wrangler.toml cron)
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(cleanupExpiredSessions(env.DB));
+  },
+
+  async fetch(request, env, ctx) {
     const url = new URL(request.url);
     if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
@@ -58,8 +80,14 @@ export default {
             await env.DB.prepare(`UPDATE payments SET processed = 1 WHERE rhid = ? AND status = 'PAID'`).bind(token).run();
           }
         }
+        // Offload expired session cleanup to ACK events (less frequent than auth polls)
+        if (ctx && ctx.waitUntil) {
+          ctx.waitUntil(cleanupExpiredSessions(env.DB));
+        }
         return new Response("ACK_OK\n", { headers: { "Content-Type": "text/plain" } });
       }
+
+      // NOTE: Expired session UPDATE moved out of per-second poll loop to reduce DB writes/reads.
 
       const timeRemainingExpr = `CAST(ROUND((julianday(p.session_expiry) - julianday('now')) * 1440) AS INTEGER)`;
 
@@ -209,7 +237,11 @@ export default {
     }
 
     if (url.pathname === "/status") {
-      const row = await env.DB.prepare("SELECT status, processed FROM payments WHERE checkout_id = ?").bind(url.searchParams.get("id")).first();
+      const checkoutId = url.searchParams.get("id");
+      if (!checkoutId) {
+        return Response.json({ status: "NOT_FOUND" }, { headers: corsHeaders });
+      }
+      const row = await env.DB.prepare("SELECT status, processed FROM payments WHERE checkout_id = ?").bind(checkoutId).first();
       return Response.json(row || { status: "NOT_FOUND" }, { headers: corsHeaders });
     }
 
@@ -341,7 +373,6 @@ function generateLoginHTML(mac, clientip, pkgs) {
       const clientIp = '${clientip}';
 
       window.addEventListener('DOMContentLoaded', () => {
-        // Save IP to localStorage and display it
         if (clientIp) {
           localStorage.setItem('bhs_client_ip', clientIp);
           document.getElementById('clientIpText').innerText = clientIp;
@@ -469,8 +500,21 @@ function generateWaitingHTML(id) {
 
       let consecutiveErrors = 0;
       const maxErrors = 5;
+      let pollCount = 0;
+      const maxPolls = 48; // Stop polling after 2 minutes (48 * 2.5s) to save DB reads
 
       const poll = setInterval(async () => {
+        pollCount++;
+        if (pollCount > maxPolls) {
+          clearInterval(poll);
+          document.getElementById('loader').style.display = "none";
+          document.getElementById('submsg').style.display = "none";
+          const errBox = document.getElementById('errorBox');
+          errBox.innerText = "Payment verification timed out. If you paid, please refresh the page.";
+          errBox.style.display = "block";
+          return;
+        }
+
         try {
           const r = await fetch('/status?id=${id}');
           if (!r.ok) {
