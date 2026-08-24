@@ -33,38 +33,10 @@ async function generateRhid(token, faskey) {
     .toLowerCase();
 }
 
-/**
- * Helper to clean up expired sessions off the hot path
- */
+// Updated helper function to purge expired active sessions
 async function cleanupExpiredSessions(db) {
-  try {
-    await db.prepare(`
-      UPDATE payments 
-      SET duration_minutes = 0 
-      WHERE status = 'PAID' 
-        AND session_expiry <= datetime('now') 
-        AND duration_minutes != 0
-    `).run();
-  } catch (e) {
-    console.error("Cleanup error:", e);
-  }
+  await db.prepare("DELETE FROM active_payments WHERE session_expiry <= datetime('now')").run();
 }
-
-const corsHeaders = {
-  "Access-Control-Allow-Origin": "*",
-  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
-  "Access-Control-Allow-Headers": "Content-Type"
-};
-
-export default {
-  // Scheduled trigger execution (if configured in wrangler.toml cron)
-  async scheduled(event, env, ctx) {
-    ctx.waitUntil(cleanupExpiredSessions(env.DB));
-  },
-
-  async fetch(request, env, ctx) {
-    const url = new URL(request.url);
-    if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
 // Helper to format auth entry with dynamically computed remaining time
 function formatAuthEntry(r) {
@@ -80,184 +52,185 @@ function formatAuthEntry(r) {
   return `* ${r.rhid} ${remainingMins} ${up} ${down} 0 0 ${r.mac_address} ${ip}`;
 }
 
-// Helper to rebuild/cache JSON arrays in KV
-async function getCachedAuthList(env, gateway, isRecovery) {
-  const kvKey = isRecovery ? `auth_recovery:${gateway}` : `auth_pending:${gateway}`;
-  
-  // 1. Try reading JSON structure directly from Cloudflare KV (0 D1 Reads)
-  const cachedDataStr = await env.KV.get(kvKey);
-  let activeClients = [];
+const corsHeaders = {
+  "Access-Control-Allow-Origin": "*",
+  "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
+  "Access-Control-Allow-Headers": "Content-Type"
+};
 
-  if (cachedDataStr !== null) {
-    activeClients = JSON.parse(cachedDataStr);
-  } else {
-    // 2. Fallback to D1 database if KV misses or is invalidated
-    // Store exact Unix timestamp (in ms) for precise expiry calculations in KV
-    const query = isRecovery 
-      ? `SELECT p.rhid, CAST((julianday(p.session_expiry) - 2440587.5) * 86400000 AS INTEGER) AS expiry_ms, 
-                p.mac_address, s.client_ip, pkg.upload_rate, pkg.download_rate 
-         FROM payments p
-         LEFT JOIN client_sessions s ON p.mac_address = s.mac_address
-         LEFT JOIN packages pkg ON p.amount = pkg.amount
-         WHERE p.status = 'PAID' AND p.session_expiry > datetime('now') AND p.gateway_hash = ? AND p.rhid IS NOT NULL`
-      : `SELECT p.rhid, CAST((julianday(p.session_expiry) - 2440587.5) * 86400000 AS INTEGER) AS expiry_ms, 
-                p.mac_address, s.client_ip, pkg.upload_rate, pkg.download_rate 
-         FROM payments p
-         LEFT JOIN client_sessions s ON p.mac_address = s.mac_address
-         LEFT JOIN packages pkg ON p.amount = pkg.amount
-         WHERE p.status = 'PAID' AND p.processed = 0 AND p.session_expiry > datetime('now') AND p.gateway_hash = ? AND p.rhid IS NOT NULL`;
+export default {
+  // Scheduled trigger execution to purge expired records from active_payments
+  async scheduled(event, env, ctx) {
+    ctx.waitUntil(cleanupExpiredSessions(env.DB));
+  },
 
-    const { results } = await env.DB.prepare(query).bind(gateway).all();
-    activeClients = results || [];
+  async fetch(request, env, ctx) {
+    const url = new URL(request.url);
+    if (request.method === "OPTIONS") return new Response(null, { headers: corsHeaders });
 
-    // Cache as JSON string with longer TTL (e.g., 30 minutes)
-    // On-the-fly math handles remaining time; triggerAuthmonUpdate handles cache invalidation
-    await env.KV.put(kvKey, JSON.stringify(activeClients), { expirationTtl: 1800 });
-  }
+    // --- 1. AUTHMON POLLING ---
+    const authGet = url.searchParams.get("auth_get");
+    if (authGet !== null) {
+      const payload = url.searchParams.get("payload") || "";
+      const gateway = url.searchParams.get("gateway") || "bhscyber"; 
 
-  // 3. Filter out expired clients in-memory & format response string
-  const nowMs = Date.now();
-  const validClients = activeClients.filter(r => r.expiry_ms > nowMs);
+      // Handle Token Acknowledgements from openNDS
+      if (payload.startsWith("*") && payload.length > 1) {
+        const tokensToAck = payload.replace(/\*/g, "").trim().split(/\s+/).filter(t => t.length > 0);
+        
+        if (tokensToAck.length > 0) {
+          const placeholders = tokensToAck.map(() => "?").join(",");
+          
+          // 1. Mark historical payments as processed
+          await env.DB.prepare(
+            `UPDATE payments SET processed = 1 WHERE rhid IN (${placeholders})`
+          ).bind(...tokensToAck).run();
 
-  if (validClients.length > 0) {
-    return validClients.map(formatAuthEntry).join("\n") + "\n";
-  }
-
-  return "*\n";
-}
-
-// --- 1. AUTHMON POLLING ---
-const authGet = url.searchParams.get("auth_get");
-if (authGet !== null) {
-  const payload = url.searchParams.get("payload") || "";
-  const isRecovery = url.searchParams.get("recovery") === "true"; 
-  const gateway = url.searchParams.get("gateway") || "bhscyber"; 
-
-  // Handle Token Acknowledgements from openNDS
-  if (payload.startsWith("*") && payload.length > 1) {
-    const tokensToAck = payload.replace(/\*/g, "").trim().split(/\s+/).filter(t => t.length > 0);
-    if (tokensToAck.length > 0) {
-      for (const token of tokensToAck) {
-        await env.DB.prepare(`UPDATE payments SET processed = 1 WHERE rhid = ? AND status = 'PAID'`).bind(token).run();
+          // 2. Remove acknowledged active tokens from the lightweight table
+          await env.DB.prepare(
+            `DELETE FROM active_payments WHERE rhid IN (${placeholders})`
+          ).bind(...tokensToAck).run();
+        }
+        
+        if (ctx && ctx.waitUntil) {
+          ctx.waitUntil(cleanupExpiredSessions(env.DB));
+        }
+        return new Response("ACK_OK\n", { headers: { "Content-Type": "text/plain" } });
       }
-      // Invalidate both lists when tokens are acknowledged
-      await env.KV.delete(`auth_pending:${gateway}`);
-      await env.KV.delete(`auth_recovery:${gateway}`);
+
+      // Query ONLY active, pending clients from active_payments
+      const query = `
+        SELECT 
+          ap.rhid, 
+          CAST((julianday(ap.session_expiry) - 2440587.5) * 86400000 AS INTEGER) AS expiry_ms, 
+          ap.mac_address, 
+          s.client_ip, 
+          pkg.upload_rate, 
+          pkg.download_rate 
+        FROM active_payments ap
+        LEFT JOIN client_sessions s ON ap.mac_address = s.mac_address
+        LEFT JOIN packages pkg ON ap.amount = pkg.amount
+        WHERE ap.processed = 0 
+          AND ap.session_expiry > datetime('now') 
+          AND ap.gateway_hash = ? 
+          AND ap.rhid IS NOT NULL`;
+
+      const { results } = await env.DB.prepare(query).bind(gateway).all();
+      const activeClients = results || [];
+
+      const nowMs = Date.now();
+      const validClients = activeClients.filter(r => r.expiry_ms > nowMs);
+
+      if (validClients.length > 0) {
+        const responseText = validClients.map(formatAuthEntry).join("\n") + "\n";
+        return new Response(responseText, { headers: { "Content-Type": "text/plain" } });
+      }
+
+      return new Response("*\n", { headers: { "Content-Type": "text/plain" } });
     }
-    
-    // Offload expired session cleanup
-    if (ctx && ctx.waitUntil) {
-      ctx.waitUntil(cleanupExpiredSessions(env.DB));
+
+    // --- 2. FAS HANDSHAKE ---
+    const fasBlob = url.searchParams.get("fas");
+    if (fasBlob) {
+      try {
+        const decoded = atob(fasBlob.replace(/ /g, "+").replace(/-/g, "+").replace(/_/g, "/"));
+        const params = new URLSearchParams(decoded.replace(/, /g, "&"));
+        const clientmac = params.get("clientmac") || "";
+        const token = params.get("hid") || "";
+        const gatewayHash = params.get("gatewayname") || "";
+        const clientip = params.get("clientip") || "";
+        const clientif = params.get("clientif") || "";
+
+        const { results: pkgs } = await env.DB.prepare(
+          "SELECT * FROM packages ORDER BY amount ASC"
+        ).all();
+
+        if (clientmac) {
+          await env.DB.prepare(`
+            INSERT INTO client_sessions (mac_address, token, gateway_hash, client_ip, client_if) 
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(mac_address) DO UPDATE SET 
+              token = excluded.token, 
+              gateway_hash = excluded.gateway_hash,
+              client_ip = excluded.client_ip,
+              client_if = excluded.client_if,
+              created_at = CURRENT_TIMESTAMP
+          `).bind(clientmac, token, gatewayHash, clientip, clientif).run();
+        }
+
+        return new Response(generateLoginHTML(clientmac, clientip, pkgs || []), { 
+          headers: { "Content-Type": "text/html; charset=utf-8" } 
+        });
+      } catch (e) {
+        return new Response("FAS Error", { status: 400 });
+      }
     }
-    return new Response("ACK_OK\n", { headers: { "Content-Type": "text/plain" } });
-  }
 
-  // Serve directly from KV
-  const responseText = await getCachedAuthList(env, gateway, isRecovery);
-  return new Response(responseText, { headers: { "Content-Type": "text/plain" } });
-}
+    // --- 3. SESSION RECONNECT ---
+    if (url.pathname === "/reconnect") {
+      const mac = url.searchParams.get("mac");
+      if (!mac) {
+        return Response.json({ success: false, error: "MAC address required" }, { status: 400, headers: corsHeaders });
+      }
 
-    // Helper to fetch packages from KV with a 6-hour (21600s) TTL before falling back to D1
-async function getCachedPackages(env) {
-  const kvKey = "packages_list";
+      const activePay = await env.DB.prepare(`
+        SELECT id, checkout_id, amount, duration_minutes, gateway_hash 
+        FROM payments 
+        WHERE mac_address = ? 
+          AND status = 'PAID' 
+          AND session_expiry > datetime('now')
+        ORDER BY created_at DESC 
+        LIMIT 1
+      `).bind(mac).first();
 
-  // 1. Read directly from KV (0 D1 Reads for 6 hours)
-  const cachedDataStr = await env.KV.get(kvKey);
-  if (cachedDataStr !== null) {
-    return JSON.parse(cachedDataStr);
-  }
+      if (!activePay) {
+        return Response.json({ success: false, error: "No active session found for this device." }, { status: 404, headers: corsHeaders });
+      }
 
-  // 2. Cache miss or expired (>6h): Query D1 database
-  const { results: pkgs } = await env.DB.prepare(
-    "SELECT * FROM packages ORDER BY amount ASC"
-  ).all();
+      const sessRow = await env.DB.prepare("SELECT id, token FROM client_sessions WHERE mac_address = ?").bind(mac).first();
+      
+      if (!sessRow) {
+        return Response.json({ success: false, error: "Session missing. Please reconnect to the Wi-Fi network." }, { status: 400, headers: corsHeaders });
+      }
 
-  const packagesList = pkgs || [];
+      const rhid = await generateRhid(sessRow.token, env.FAS_KEY);
 
-  // 3. Store in KV with a strict 6-hour Time-To-Live (TTL)
-  // 21,600 seconds = 6 hours
-  await env.KV.put(kvKey, JSON.stringify(packagesList), { expirationTtl: 21600 });
-
-  return packagesList;
-}
-
-// --- 2. FAS HANDSHAKE ---
-const fasBlob = url.searchParams.get("fas");
-if (fasBlob) {
-  try {
-    const decoded = atob(fasBlob.replace(/ /g, "+").replace(/-/g, "+").replace(/_/g, "/"));
-    const params = new URLSearchParams(decoded.replace(/, /g, "&"));
-    const clientmac = params.get("clientmac") || "";
-    const token = params.get("hid") || "";
-    const gatewayHash = params.get("gatewayname") || "";
-    const clientip = params.get("clientip") || "";
-    const clientif = params.get("clientif") || "";
-
-    // Read packages directly from KV (refreshes from D1 automatically every 6 hours)
-    const pkgs = await getCachedPackages(env);
-
-   if (clientmac) {
+      // 1. Update source-of-truth table
       await env.DB.prepare(`
-        INSERT INTO client_sessions (mac_address, token, gateway_hash, client_ip, client_if) 
-        VALUES (?, ?, ?, ?, ?)
-        ON CONFLICT(mac_address) DO UPDATE SET 
-          token = excluded.token, 
-          gateway_hash = excluded.gateway_hash,
-          client_ip = excluded.client_ip,
-          client_if = excluded.client_if,
-          created_at = CURRENT_TIMESTAMP
-      `).bind(clientmac, token, gatewayHash, clientip, clientif).run();
+        UPDATE payments 
+        SET processed = 0, session_id = ?, rhid = ? 
+        WHERE id = ?
+      `).bind(sessRow.id, rhid, activePay.id).run();
 
-      // FIX: Mirror session data to KV so /initiate-stk hits cache
-      await env.KV.put(
-        `session:${clientmac}`, 
-        JSON.stringify({ gateway_hash: gatewayHash, token: token }), 
-        { expirationTtl: 120} // 2 minutes TTL
-      );
+      await env.DB.prepare("UPDATE client_sessions SET rhid = ? WHERE id = ?").bind(rhid, sessRow.id).run();
+
+      // 2. Insert or replace into active_payments for polling
+      await env.DB.prepare(`
+        INSERT INTO active_payments (payment_id, rhid, checkout_id, mac_address, gateway_hash, amount, session_expiry, processed)
+        SELECT id, rhid, checkout_id, mac_address, gateway_hash, amount, session_expiry, 0
+        FROM payments WHERE id = ?
+        ON CONFLICT(payment_id) DO UPDATE SET rhid = excluded.rhid, processed = 0
+      `).bind(activePay.id).run();
+
+      return Response.json({ success: true, checkout_id: activePay.checkout_id }, { headers: corsHeaders });
     }
 
-    return new Response(generateLoginHTML(clientmac, clientip, pkgs), { 
-      headers: { "Content-Type": "text/html; charset=utf-8" } 
-    });
-  } catch (e) {
-    return new Response("FAS Error", { status: 400 });
-  }
-}
-
-// --- 3. M-PESA STK PUSH ---
+    // --- 4. M-PESA STK PUSH ---
     if (url.pathname === "/initiate-stk") {
       const rawPhone = url.searchParams.get("phone");
       const phone = cleanPhoneNumber(rawPhone);
       const mac = url.searchParams.get("mac");
       const pkgId = url.searchParams.get("pkg");
 
-      // 1. KV READ FOR PACKAGE (Fallback to D1 source of truth)
-      let pkg = null;
-      const cachedPackagesStr = await env.KV.get("packages_list");
-      if (cachedPackagesStr !== null) {
-        const pkgs = JSON.parse(cachedPackagesStr);
-        pkg = pkgs.find(p => String(p.id) === String(pkgId)) || null;
-      }
-      
-      if (!pkg) {
-        pkg = await env.DB.prepare("SELECT * FROM packages WHERE id = ?").bind(pkgId).first();
-      }
-
+      const pkg = await env.DB.prepare("SELECT * FROM packages WHERE id = ?").bind(pkgId).first();
       if (!pkg) {
         return Response.json({ success: false, error: "Invalid package" }, { status: 400, headers: corsHeaders });
       }
 
-      // 2. KV READ FOR SESSION (Fallback to D1 source of truth)
       let gatewayHash = "";
       if (mac) {
-        const cachedSessionStr = await env.KV.get(`session:${mac}`);
-        if (cachedSessionStr !== null) {
-          const sessionObj = JSON.parse(cachedSessionStr);
-          gatewayHash = sessionObj.gateway_hash || "";
-        } else {
-          const session = await env.DB.prepare("SELECT gateway_hash FROM client_sessions WHERE mac_address = ?").bind(mac).first();
-          gatewayHash = session ? session.gateway_hash : "";
-        }
+        const session = await env.DB.prepare("SELECT gateway_hash FROM client_sessions WHERE mac_address = ?").bind(mac).first();
+        gatewayHash = session ? session.gateway_hash : "";
       }
 
       try {
@@ -296,15 +269,14 @@ if (fasBlob) {
       }
     }
 
-    // --- 4. CALLBACK & STATUS ---
-
+    // --- 5. CALLBACK & STATUS ---
     if (url.pathname === "/notif-cv") {
       const data = await request.json();
       const result = data.Body.stkCallback;
 
       if (result.ResultCode === 0) {
         const payRow = await env.DB.prepare(
-          "SELECT status, mac_address, duration_minutes, gateway_hash FROM payments WHERE checkout_id = ?"
+          "SELECT id, status, mac_address, duration_minutes, gateway_hash, amount FROM payments WHERE checkout_id = ?"
         ).bind(result.CheckoutRequestID).first();
 
         if (payRow && payRow.status === 'PAID') {
@@ -319,10 +291,10 @@ if (fasBlob) {
           if (sessRow) {
             const rhid = await generateRhid(sessRow.token, env.FAS_KEY);
 
-            // Update D1 (Source of Truth)
             await env.DB.prepare("UPDATE client_sessions SET rhid = ? WHERE id = ?")
               .bind(rhid, sessRow.id).run();
 
+            // 1. Update source of truth (payments)
             await env.DB.prepare(`
               UPDATE payments 
               SET status = 'PAID', 
@@ -332,32 +304,13 @@ if (fasBlob) {
               WHERE checkout_id = ?
             `).bind(sessRow.id, rhid, payRow.duration_minutes, result.CheckoutRequestID).run();
 
-            // -------------------------------------------------------------
-            // EXTEND KV SESSION TTL TO MATCH PACKAGE DURATION
-            // -------------------------------------------------------------
-            const packageTtlSeconds = Math.max(payRow.duration_minutes * 60, 60); // Minimum 60s rule for KV
-            
-            const updatedSessionData = {
-              gateway_hash: payRow.gateway_hash || "",
-              token: sessRow.token,
-              rhid: rhid,
-              status: "ACTIVE",
-              expires_at: Date.now() + (packageTtlSeconds * 1000)
-            };
-
-            await env.KV.put(
-              `session:${payRow.mac_address}`, 
-              JSON.stringify(updatedSessionData), 
-              { expirationTtl: packageTtlSeconds }
-            );
-
-            // Invalidate router polling cache
-            const gateway = payRow.gateway_hash || "bhscyber";
-            if (ctx && ctx.waitUntil) {
-              ctx.waitUntil(triggerAuthmonUpdate(env, gateway));
-            } else {
-              await triggerAuthmonUpdate(env, gateway);
-            }
+            // 2. Push active session details to active_payments table
+            await env.DB.prepare(`
+              INSERT INTO active_payments (payment_id, rhid, checkout_id, mac_address, gateway_hash, amount, session_expiry, processed)
+              SELECT id, rhid, checkout_id, mac_address, gateway_hash, amount, session_expiry, 0
+              FROM payments WHERE checkout_id = ?
+              ON CONFLICT(payment_id) DO UPDATE SET rhid = excluded.rhid, processed = 0, session_expiry = excluded.session_expiry
+            `).bind(result.CheckoutRequestID).run();
           }
         }
       } else {
@@ -366,12 +319,6 @@ if (fasBlob) {
       }
 
       return new Response("OK");
-    }
-
-    // Helper to invalidate KV cache
-    async function triggerAuthmonUpdate(env, gateway) {
-      await env.KV.delete(`auth_pending:${gateway}`);
-      await env.KV.delete(`auth_recovery:${gateway}`);
     }
 
     if (url.pathname === "/status") {
@@ -396,300 +343,865 @@ function generateLoginHTML(mac, clientip, pkgs) {
     const speedMbps = p.download_rate ? (p.download_rate / 1000).toFixed(0) : 'Max';
     return `
       <div class="pkg ${idx === 0 ? 'selected' : ''}" id="pkg-${p.id}" onclick="sel('${p.id}')">
-        <div class="pkg-name">${p.name}</div>
-        <div class="pkg-price">${p.amount}</div>
-        <div class="pkg-speed">${speedMbps} Mbps</div>
+        <div class="pkg-header">
+          <span class="pkg-name">${p.name}</span>
+          <span class="pkg-badge">${speedMbps} Mbps</span>
+        </div>
+        <div class="pkg-price-container">
+          <span class="pkg-currency">KSh</span>
+          <span class="pkg-price">${p.amount}</span>
+        </div>
       </div>
     `;
   }).join('');
 
   const firstPkgId = pkgs.length > 0 ? pkgs[0].id : '';
 
-  return `<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>BHS WIFI - Connect</title>
   <style>
-    :root { --glass: rgba(10, 10, 10, 0.92); --border: rgba(255, 255, 255, 0.18); --accent: #2ecc71; }
-
-    body { 
-      font-family: 'Inter', -apple-system, system-ui, sans-serif; 
-      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-      background: linear-gradient(-45deg, #ee7752, #e73c7e, #23a6d5, #23d5ab, #9b59b6, #f1c40f);
-      background-size: 600% 600%;
-      animation: rainbowBG 18s ease infinite;
-      color: #fff; padding: 10px; box-sizing: border-box;
-      overflow-x: hidden;
+    :root {
+      --bg-glass: rgba(18, 20, 29, 0.85);
+      --card-border: rgba(255, 255, 255, 0.12);
+      --accent: #10b981;
+      --accent-glow: rgba(16, 185, 129, 0.25);
+      --accent-hover: #059669;
+      --text-main: #ffffff;
+      --text-muted: #94a3b8;
     }
 
-    @keyframes rainbowBG {
-      0% { background-position: 0% 50%; }
-      50% { background-position: 100% 50%; }
-      100% { background-position: 0% 50%; }
+    * { box-sizing: border-box; }
+
+    body { 
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+      margin: 0; 
+      min-height: 100vh; 
+      display: flex; 
+      align-items: center; 
+      justify-content: center;
+      background: #0f172a;
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(30, 58, 138, 0.5) 0px, transparent 50%),
+        radial-gradient(at 100% 100%, rgba(16, 185, 129, 0.2) 0px, transparent 50%),
+        radial-gradient(at 50% 50%, rgba(15, 23, 42, 0.9) 0px, transparent 100%);
+      color: var(--text-main); 
+      padding: 16px;
     }
 
     .card { 
-      background: var(--glass); padding: 22px; border-radius: 30px; backdrop-filter: blur(30px); -webkit-backdrop-filter: blur(30px); 
-      border: 1px solid var(--border); max-width: 400px; width: 100%; box-shadow: 0 25px 50px rgba(0,0,0,0.6);
+      background: var(--bg-glass); 
+      padding: 24px; 
+      border-radius: 24px; 
+      backdrop-filter: blur(20px); 
+      -webkit-backdrop-filter: blur(20px); 
+      border: 1px solid var(--card-border); 
+      max-width: 420px; 
+      width: 100%; 
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
     }
 
-    h2 { font-weight: 900; margin: 0; font-size: 26px; color: #fff; letter-spacing: -1px; text-align: center; }
-    .sub-head { color: var(--accent); font-size: 11px; margin-bottom: 16px; text-transform: uppercase; letter-spacing: 3px; font-weight: 800; text-align: center; }
-    .ip-display { font-size: 10px; color: rgba(255, 255, 255, 0.7); text-transform: none; letter-spacing: normal; margin-top: 4px; font-weight: 600; }
-
-    .section-label { 
-      text-align: left; font-size: 10px; font-weight: 900; color: rgba(255,255,255,0.6); 
-      margin: 0 0 8px 5px; text-transform: uppercase; display: flex; align-items: center;
-    }
-    .section-label::before {
-      content: ''; display: inline-block; width: 6px; height: 6px; background: var(--accent); margin-right: 8px; border-radius: 50%;
+    .brand-header {
+      text-align: center;
+      margin-bottom: 20px;
     }
 
+    .brand-title { 
+      font-weight: 800; 
+      margin: 0; 
+      font-size: 24px; 
+      letter-spacing: -0.5px; 
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 8px;
+    }
+
+    .wifi-icon {
+      width: 20px;
+      height: 20px;
+      fill: var(--accent);
+    }
+
+    .sub-head { 
+      color: var(--accent); 
+      font-size: 11px; 
+      margin-top: 4px; 
+      text-transform: uppercase; 
+      letter-spacing: 2px; 
+      font-weight: 700; 
+    }
+
+    .ip-display { 
+      font-size: 11px; 
+      color: var(--text-muted); 
+      text-transform: none; 
+      letter-spacing: normal; 
+      margin-top: 2px; 
+      font-weight: 500; 
+    }
+
+    .hidden { display: none !important; }
+
+    /* Service Grid */
+    .section-title {
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-muted);
+      text-transform: uppercase;
+      letter-spacing: 1px;
+      margin-bottom: 10px;
+      display: flex;
+      align-items: center;
+      gap: 6px;
+    }
+
+    .section-title::before {
+      content: '';
+      width: 6px;
+      height: 6px;
+      background: var(--accent);
+      border-radius: 50%;
+    }
+
+    .services-grid { 
+      display: grid; 
+      grid-template-columns: repeat(2, 1fr); 
+      gap: 8px; 
+      margin-bottom: 18px; 
+    }
+
+    .service-item { 
+      background: rgba(255, 255, 255, 0.03); 
+      padding: 10px; 
+      border-radius: 12px; 
+      border: 1px solid rgba(255, 255, 255, 0.06); 
+      font-size: 11px; 
+      font-weight: 600; 
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+
+    .service-item .icon { font-size: 16px; }
+
+    /* Contact Banner */
+    .contact-card {
+      background: rgba(16, 185, 129, 0.08); 
+      border: 1px solid rgba(16, 185, 129, 0.3); 
+      border-radius: 14px; 
+      padding: 12px 14px; 
+      margin-bottom: 18px; 
+      display: flex; 
+      align-items: center; 
+      justify-content: space-between;
+    }
+
+    .contact-title { font-size: 10px; text-transform: uppercase; font-weight: 800; color: var(--accent); letter-spacing: 1px; }
+    .contact-num { font-size: 13px; font-weight: 700; margin-top: 2px; }
+    .contact-hours { font-size: 10px; color: var(--text-muted); }
+    .contact-actions { display: flex; gap: 6px; }
+
+    .c-btn {
+      background: #25d366; 
+      color: #fff; 
+      border: none; 
+      padding: 6px 12px; 
+      border-radius: 8px; 
+      font-size: 11px; 
+      font-weight: 700; 
+      text-decoration: none; 
+      display: inline-flex; 
+      align-items: center; 
+      gap: 4px;
+      transition: 0.2s;
+    }
+
+    .c-btn.phone { background: #3b82f6; }
+    .c-btn:hover { opacity: 0.9; }
+
+    /* Packages UI */
     .pkg-grid { 
-      display: grid; grid-template-columns: repeat(2, 1fr); gap: 10px; margin-bottom: 20px; 
+      display: grid; 
+      grid-template-columns: repeat(2, 1fr); 
+      gap: 10px; 
+      margin-bottom: 18px; 
     }
 
     .pkg { 
-      background: rgba(255,255,255,0.06); border: 1px solid var(--border); 
-      padding: 12px 5px; border-radius: 14px; cursor: pointer; transition: 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275);
-      display: flex; flex-direction: column; align-items: center; justify-content: center;
-      position: relative;
-    }
-    .pkg.selected { border: 2.5px solid var(--accent); background: rgba(46, 204, 113, 0.2); transform: translateY(-3px); box-shadow: 0 10px 20px rgba(0,0,0,0.3); }
-    .pkg-name { font-size: 10px; opacity: 0.9; margin-bottom: 2px; font-weight: 700; text-transform: uppercase; }
-    .pkg-price { font-size: 18px; font-weight: 900; }
-    .pkg-price::after { content: "/-"; font-size: 12px; margin-left: 1px; opacity: 0.6; }
-
-    .pkg-speed { 
-      font-size: 9px; background: var(--accent); color: #000; padding: 2px 6px; 
-      border-radius: 8px; margin-top: 4px; font-weight: 800; text-transform: uppercase;
+      background: rgba(255, 255, 255, 0.04); 
+      border: 1px solid var(--card-border); 
+      padding: 12px; 
+      border-radius: 14px; 
+      cursor: pointer; 
+      transition: all 0.2s ease;
+      display: flex; 
+      flex-direction: column; 
+      justify-content: space-between;
     }
 
-    .input-container { background: rgba(255,255,255,0.04); border-radius: 16px; padding: 12px; border: 1px solid var(--border); margin-bottom: 15px; }
+    .pkg:hover {
+      border-color: rgba(255, 255, 255, 0.3);
+      background: rgba(255, 255, 255, 0.07);
+    }
+
+    .pkg.selected { 
+      border: 2px solid var(--accent); 
+      background: rgba(16, 185, 129, 0.12); 
+      box-shadow: 0 4px 15px var(--accent-glow); 
+    }
+
+    .pkg-header { display: flex; justify-content: space-between; align-items: center; width: 100%; margin-bottom: 6px; }
+    .pkg-name { font-size: 11px; font-weight: 700; color: var(--text-main); text-transform: uppercase; }
+    .pkg-badge { font-size: 9px; background: var(--accent); color: #000; padding: 2px 6px; border-radius: 6px; font-weight: 800; }
+
+    .pkg-price-container { display: flex; align-items: baseline; gap: 2px; }
+    .pkg-currency { font-size: 12px; font-weight: 600; color: var(--text-muted); }
+    .pkg-price { font-size: 20px; font-weight: 800; }
+
+    /* Inputs & Buttons */
+    .input-group {
+      margin-bottom: 16px;
+    }
+
+    .input-label {
+      display: block;
+      font-size: 11px;
+      font-weight: 700;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+
     input { 
-      width: 100%; padding: 12px; border-radius: 10px; border: 1px solid rgba(255,255,255,0.1); 
-      background: #000; color: #fff; font-size: 20px; font-weight: 800; 
-      box-sizing: border-box; text-align: center; outline: none; transition: 0.3s;
+      width: 100%; 
+      padding: 14px; 
+      border-radius: 12px; 
+      border: 1px solid var(--card-border); 
+      background: rgba(0, 0, 0, 0.3); 
+      color: #fff; 
+      font-size: 18px; 
+      font-weight: 700; 
+      box-sizing: border-box; 
+      text-align: center; 
+      outline: none; 
+      letter-spacing: 1px;
+      transition: 0.2s;
     }
-    input:focus { border-color: var(--accent); box-shadow: 0 0 15px rgba(46, 204, 113, 0.3); }
+
+    input:focus { 
+      border-color: var(--accent); 
+      box-shadow: 0 0 0 3px var(--accent-glow); 
+    }
+
+    /* Helper Step Guide */
+    .mini-steps {
+      background: rgba(255, 255, 255, 0.03);
+      border-radius: 12px;
+      padding: 10px 12px;
+      margin-bottom: 16px;
+      border: 1px solid rgba(255, 255, 255, 0.05);
+    }
+
+    .mini-step-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      font-size: 11px;
+      color: var(--text-muted);
+      margin-bottom: 6px;
+    }
+
+    .mini-step-item:last-child { margin-bottom: 0; }
+    .mini-step-num {
+      width: 16px; height: 16px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.1);
+      color: #fff;
+      display: flex; align-items: center; justify-content: center;
+      font-size: 9px; font-weight: 800; flex-shrink: 0;
+    }
 
     .btn { 
-      background: var(--accent); color: #000; border: none; padding: 16px; width: 100%; 
-      border-radius: 16px; font-weight: 900; cursor: pointer; font-size: 15px; 
-      text-transform: uppercase; letter-spacing: 1px; transition: 0.3s;
+      background: var(--accent); 
+      color: #000; 
+      border: none; 
+      padding: 16px; 
+      width: 100%; 
+      border-radius: 12px; 
+      font-weight: 800; 
+      cursor: pointer; 
+      font-size: 14px; 
+      text-transform: uppercase; 
+      letter-spacing: 0.5px; 
+      transition: 0.2s;
+      box-shadow: 0 4px 12px var(--accent-glow);
     }
-    .btn:active { transform: scale(0.97); }
 
-    .error-msg {
-      color: #e74c3c; font-size: 12px; font-weight: 700; margin-top: 10px; text-align: center; min-height: 16px;
+    .btn:hover { background: var(--accent-hover); }
+    .btn:active { transform: scale(0.98); }
+
+    .btn.reconnect {
+      background: rgba(255, 255, 255, 0.08);
+      color: #fff;
+      border: 1px solid var(--card-border);
+      box-shadow: none;
+      margin-top: 10px;
     }
 
-    .ad-box { margin-top: 15px; font-size: 11px; padding-top: 12px; border-top: 1px solid var(--border); color: rgba(255,255,255,0.5); line-height: 1.4; text-align: center; }
-  </style></head>
-  <body>
+    .btn.reconnect:hover {
+      background: rgba(255, 255, 255, 0.15);
+      border-color: rgba(255, 255, 255, 0.3);
+    }
 
-    <div class="card">
-      <h2>BHS WIFI</h2>
-      <div class="sub-head">
-        Ultra High Speed
-        <div class="ip-display">Device IP: <span id="clientIpText">Detecting...</span></div>
-      </div>
+    .btn.back { 
+      background: transparent; 
+      color: var(--text-muted); 
+      padding: 10px; 
+      margin-top: 8px; 
+      font-size: 12px; 
+      border: none; 
+      box-shadow: none;
+      text-transform: none;
+    }
 
-      <div class="section-label">1. Select Paid Plan</div>
-      <div class="pkg-grid">${pkgElements}</div>
-      <div class="section-label">2. M-Pesa Number</div>
-      <div class="input-container">
-        <input type="tel" id="phone" placeholder="0712 345 678" maxlength="12">
-      </div>
-      <button class="btn" id="payBtn" onclick="pay()">Secure Connect</button>
-      <div id="errorDisplay" class="error-msg"></div>
-      <div class="ad-box">
-        <strong>BHS CYBER SERVICES</strong><br>KRA, e-Citizen & Printing.
-      </div>
+    .btn.back:hover { color: #fff; }
+
+    .error-msg { 
+      color: #ef4444; 
+      font-size: 12px; 
+      font-weight: 600; 
+      margin-top: 10px; 
+      text-align: center; 
+      min-height: 16px; 
+    }
+
+    .divider {
+      text-align: center;
+      margin: 14px 0 6px 0;
+      color: var(--text-muted);
+      font-size: 11px;
+      font-weight: 700;
+      letter-spacing: 1px;
+      text-transform: uppercase;
+    }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <div class="brand-header">
+      <h2 class="brand-title">
+        <svg class="wifi-icon" viewBox="0 0 24 24"><path d="M12 3C7.03 3 2.5 5.2 0 8.61L12 22 24 8.6C21.5 5.2 16.97 3 12 3zm0 4c3.87 0 7.39 1.54 10 4.06L12 21.05 2 11.06C4.61 8.54 8.13 7 12 7z"/></svg>
+        BHS WIFI
+      </h2>
+      <div class="sub-head">High-Speed Cyber Portal</div>
+      <div class="ip-display">IP Address: <span id="clientIpText">Detecting...</span></div>
     </div>
 
-    <script>
-      let selectedPkgId = '${firstPkgId}';
-      const macAddress = '${mac}';
-      const clientIp = '${clientip}';
+    <div id="adView">
+      <div class="section-title">Cyber & Online Services</div>
+      <div class="services-grid">
+        <div class="service-item"><span class="icon">📋</span> KRA Returns & PIN</div>
+        <div class="service-item"><span class="icon">🏛️</span> eCitizen Applications</div>
+        <div class="service-item"><span class="icon">✈️</span> Passport & Visas</div>
+        <div class="service-item"><span class="icon">🖨️</span> Print, Scan & Copy</div>
+        <div class="service-item"><span class="icon">🚗</span> NTSA Licensing</div>
+        <div class="service-item"><span class="icon">🆔</span> Good Conduct (DCI)</div>
+        <div class="service-item"><span class="icon">🎓</span> KUCCPS & HELB</div>
+        <div class="service-item"><span class="icon">💼</span> Business Permits</div>
+      </div>
 
-      window.addEventListener('DOMContentLoaded', () => {
-        if (clientIp) {
-          localStorage.setItem('bhs_client_ip', clientIp);
-          document.getElementById('clientIpText').innerText = clientIp;
-        } else {
-          const storedIp = localStorage.getItem('bhs_client_ip');
-          document.getElementById('clientIpText').innerText = storedIp || 'Unavailable';
-        }
-      });
+      <div class="contact-card">
+        <div>
+          <div class="contact-title">Need Help Connecting?</div>
+          <div class="contact-num">0707 759 220</div>
+          <div class="contact-hours">Help Desk: 8am – 6pm</div>
+        </div>
+        <div class="contact-actions">
+          <a href="https://wa.me/254707759220?text=Hi%20BHS%20Cyber,%20I%20need%20help%20connecting%20to%20WIFI" target="_blank" class="c-btn">WhatsApp</a>
+          <a href="tel:0707759220" class="c-btn phone">Call</a>
+        </div>
+      </div>
 
-      function sel(id) { 
-        selectedPkgId = id; 
-        document.querySelectorAll('.pkg').forEach(e=>e.classList.remove('selected')); 
-        document.getElementById('pkg-'+id).classList.add('selected'); 
+      <button class="btn" onclick="showPackages()">Buy Data Package</button>
+      <button class="btn reconnect" id="reconnectBtn" onclick="reconnect()">Restore Paid Session</button>
+      <div id="homeErrorDisplay" class="error-msg"></div>
+    </div>
+
+    <div id="payView" class="hidden">
+      <div class="section-title">1. Select Data Package</div>
+      <div class="pkg-grid">${pkgElements}</div>
+
+      <div class="mini-steps">
+        <div class="mini-step-item">
+          <div class="mini-step-num">1</div>
+          <span>Select your package above.</span>
+        </div>
+        <div class="mini-step-item">
+          <div class="mini-step-num">2</div>
+          <span>Enter your M-Pesa number & tap <strong>Pay & Connect</strong>.</span>
+        </div>
+        <div class="mini-step-item">
+          <div class="mini-step-num">3</div>
+          <span>Enter your M-Pesa PIN when prompted on your phone.</span>
+        </div>
+      </div>
+
+      <div class="input-group">
+        <label class="input-label" for="phone">2. M-Pesa Phone Number</label>
+        <input type="tel" id="phone" placeholder="07XX XXX XXX" maxlength="12" autocomplete="tel">
+      </div>
+
+      <button class="btn" id="payBtn" onclick="pay()">Pay & Connect</button>
+      <button class="btn back" onclick="showAd()">← Back to Services</button>
+      <div id="errorDisplay" class="error-msg"></div>
+    </div>
+  </div>
+
+  <script>
+    let selectedPkgId = '${firstPkgId}';
+    const macAddress = '${mac}';
+    const clientIp = '${clientip}';
+
+    window.addEventListener('DOMContentLoaded', () => {
+      if (clientIp) {
+        localStorage.setItem('bhs_client_ip', clientIp);
+        document.getElementById('clientIpText').innerText = clientIp;
+      } else {
+        const storedIp = localStorage.getItem('bhs_client_ip');
+        document.getElementById('clientIpText').innerText = storedIp || 'Unavailable';
       }
+    });
 
-      async function pay() {
-        if (window.speechSynthesis) {
-           const initial = new SpeechSynthesisUtterance("");
-           window.speechSynthesis.speak(initial);
-        }
+    function showPackages() {
+      document.getElementById('adView').classList.add('hidden');
+      document.getElementById('payView').classList.remove('hidden');
+    }
 
-        const ph = document.getElementById('phone').value.trim();
-        const errEl = document.getElementById('errorDisplay');
-        errEl.innerText = '';
+    function showAd() {
+      document.getElementById('payView').classList.add('hidden');
+      document.getElementById('adView').classList.remove('hidden');
+    }
 
-        if(ph.length < 10) {
-          errEl.innerText = 'Please enter a valid phone number';
-          return;
-        }
+    function sel(id) { 
+      selectedPkgId = id; 
+      document.querySelectorAll('.pkg').forEach(e => e.classList.remove('selected')); 
+      document.getElementById('pkg-' + id).classList.add('selected'); 
+    }
 
-        const btn = document.getElementById('payBtn');
-        btn.disabled = true; btn.innerText = "Processing...";
+    async function reconnect() {
+      const btn = document.getElementById('reconnectBtn');
+      const errEl = document.getElementById('homeErrorDisplay');
+      errEl.innerText = '';
+      btn.disabled = true;
+      btn.innerText = "Restoring session...";
 
+      try {
+        const r = await fetch('/reconnect?mac=' + encodeURIComponent(macAddress));
+        let d;
         try {
-          const r = await fetch('/initiate-stk?phone='+encodeURIComponent(ph)+'&mac=${mac}&pkg='+selectedPkgId);
-          let d;
-          try {
-            d = await r.json();
-          } catch(parseErr) {
-            throw new Error('Invalid server response format.');
-          }
-
-          if(!r.ok) {
-            throw new Error(d.error || 'Server responded with an error status (' + r.status + ')');
-          }
-
-          if(d.success) {
-            window.location.href = '/waiting?id=' + d.checkout_id;
-          } else {
-            throw new Error(d.error || 'STK Push failed');
-          }
-        } catch(e) {
-          errEl.innerText = e.message || 'Network error occurred. Please try again.';
-          btn.disabled = false; 
-          btn.innerText = "Secure Connect";
+          d = await r.json();
+        } catch(parseErr) {
+          throw new Error('Invalid response from server.');
         }
+
+        if (d.success) {
+          window.location.href = '/waiting?id=' + d.checkout_id;
+        } else {
+          throw new Error(d.error || 'No active paid session found.');
+        }
+      } catch(e) {
+        errEl.innerText = e.message || 'Error restoring session. Try purchasing a package.';
+        btn.disabled = false;
+        btn.innerText = "Restore Paid Session";
       }
-    </script>
-  </body></html>`;
+    }
+
+    async function pay() {
+      if (window.speechSynthesis) {
+         const initial = new SpeechSynthesisUtterance("");
+         window.speechSynthesis.speak(initial);
+      }
+
+      const ph = document.getElementById('phone').value.trim();
+      const errEl = document.getElementById('errorDisplay');
+      errEl.innerText = '';
+
+      if (ph.length < 10) {
+        errEl.innerText = 'Please enter a valid phone number (e.g. 0712345678)';
+        return;
+      }
+
+      const btn = document.getElementById('payBtn');
+      btn.disabled = true; 
+      btn.innerText = "Check your phone for PIN prompt...";
+
+      try {
+        const r = await fetch('/initiate-stk?phone=' + encodeURIComponent(ph) + '&mac=' + encodeURIComponent(macAddress) + '&pkg=' + selectedPkgId);
+        let d;
+        try {
+          d = await r.json();
+        } catch(parseErr) {
+          throw new Error('Invalid server response format.');
+        }
+
+        if (!r.ok) {
+          throw new Error(d.error || 'Server responded with an error status (' + r.status + ')');
+        }
+
+        if (d.success) {
+          window.location.href = '/waiting?id=' + d.checkout_id;
+        } else {
+          throw new Error(d.error || 'STK Push failed');
+        }
+      } catch(e) {
+        errEl.innerText = e.message || 'Network error occurred. Please try again.';
+        btn.disabled = false; 
+        btn.innerText = "Pay & Connect";
+      }
+    }
+  </script>
+</body>
+</html>`;
 }
 
 function generateWaitingHTML(id) {
-  return `<html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+  return `<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no">
+  <title>BHS WIFI - Verifying Payment</title>
   <style>
-    :root { --glass: rgba(10, 10, 10, 0.95); --accent: #2ecc71; }
-    body { 
-      margin: 0; min-height: 100vh; display: flex; align-items: center; justify-content: center;
-      background: linear-gradient(-45deg, #ee7752, #e73c7e, #23a6d5, #23d5ab, #9b59b6, #f1c40f);
-      background-size: 600% 600%;
-      animation: rainbowBG 18s ease infinite;
-      font-family: sans-serif; color: white; text-align: center;
-      padding: 10px; box-sizing: border-box;
+    :root {
+      --bg-glass: rgba(18, 20, 29, 0.88);
+      --card-border: rgba(255, 255, 255, 0.12);
+      --accent: #10b981;
+      --accent-glow: rgba(16, 185, 129, 0.25);
+      --danger: #ef4444;
+      --text-main: #ffffff;
+      --text-muted: #94a3b8;
     }
-    @keyframes rainbowBG {
-      0% { background-position: 0% 50%; }
-      50% { background-position: 100% 50%; }
-      100% { background-position: 0% 50%; }
-    }
-    .card { padding: 40px 25px; background: var(--glass); border-radius: 30px; width: 85%; max-width: 350px; border: 1px solid rgba(255,255,255,0.2); box-shadow: 0 30px 60px rgba(0,0,0,0.7); }
-    .loader { border: 5px solid rgba(255,255,255,0.1); border-top: 5px solid var(--accent); border-radius: 50%; width: 50px; height: 50px; animation: spin 1s linear infinite; margin: 25px auto; }
-    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
-    .status-text { font-size: 22px; font-weight: 800; margin-bottom: 12px; }
-    .sub-text { opacity: 0.7; font-size: 14px; line-height: 1.5; margin-bottom: 10px; }
-    .ip-info { font-size: 12px; color: rgba(255, 255, 255, 0.6); margin-bottom: 20px; font-weight: 600; }
-    .error-box { color: #e74c3c; font-size: 13px; font-weight: 700; margin-top: 10px; display: none; }
-    .ad-container { background: rgba(255,255,255,0.05); border-radius: 16px; padding: 15px; border: 1px dashed rgba(255,255,255,0.2); font-size: 13px; }
-    .ad-slide { display: none; }
-    .ad-slide.active { display: block; animation: fadeIn 0.5s; }
-    @keyframes fadeIn { from { opacity: 0; } to { opacity: 1; } }
-  </style></head>
-  <body>
 
-    <div class="card">
-      <div id="loader" class="loader"></div>
-      <div class="status-text" id="msg">Verifying Session</div>
-      <p class="sub-text" id="submsg">Connecting to BHS WiFi...</p>
-      <div class="ip-info">IP: <span id="waitingIp">Loading...</span></div>
-      <div id="errorBox" class="error-box"></div>
-      <div class="ad-container">
-        <div class="ad-slide active"><strong>Fast Printing</strong><br>Color prints available now.</div>
-        <div class="ad-slide"><strong>Cyber Services</strong><br>KRA & e-Citizen services.</div>
+    * { box-sizing: border-box; }
+
+    body { 
+      font-family: 'Inter', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif; 
+      margin: 0; 
+      min-height: 100vh; 
+      display: flex; 
+      align-items: center; 
+      justify-content: center;
+      background: #0f172a;
+      background-image: 
+        radial-gradient(at 0% 0%, rgba(30, 58, 138, 0.5) 0px, transparent 50%),
+        radial-gradient(at 100% 100%, rgba(16, 185, 129, 0.2) 0px, transparent 50%),
+        radial-gradient(at 50% 50%, rgba(15, 23, 42, 0.9) 0px, transparent 100%);
+      color: var(--text-main); 
+      padding: 16px;
+      text-align: center;
+    }
+
+    .card { 
+      background: var(--bg-glass); 
+      padding: 24px; 
+      border-radius: 24px; 
+      backdrop-filter: blur(20px); 
+      -webkit-backdrop-filter: blur(20px); 
+      border: 1px solid var(--card-border); 
+      max-width: 380px; 
+      width: 100%; 
+      box-shadow: 0 20px 40px rgba(0, 0, 0, 0.5);
+    }
+
+    /* Modern Loader */
+    .loader-container {
+      position: relative;
+      width: 60px;
+      height: 60px;
+      margin: 10px auto 20px;
+    }
+
+    .loader { 
+      border: 4px solid rgba(255, 255, 255, 0.08); 
+      border-top: 4px solid var(--accent); 
+      border-radius: 50%; 
+      width: 100%; 
+      height: 100%; 
+      animation: spin 1s linear infinite; 
+    }
+
+    @keyframes spin { 0% { transform: rotate(0deg); } 100% { transform: rotate(360deg); } }
+
+    .status-text { 
+      font-size: 20px; 
+      font-weight: 800; 
+      margin-bottom: 6px; 
+      letter-spacing: -0.3px;
+    }
+
+    .sub-text { 
+      color: var(--text-muted); 
+      font-size: 13px; 
+      line-height: 1.4; 
+      margin-top: 0;
+      margin-bottom: 12px; 
+    }
+
+    .ip-info { 
+      font-size: 11px; 
+      color: var(--text-muted); 
+      margin-bottom: 20px; 
+      font-weight: 500; 
+    }
+
+    .error-box { 
+      background: rgba(239, 68, 68, 0.1);
+      border: 1px solid rgba(239, 68, 68, 0.3);
+      color: #fca5a5; 
+      font-size: 12px; 
+      font-weight: 600; 
+      padding: 12px;
+      border-radius: 12px;
+      margin-top: 15px; 
+      margin-bottom: 15px;
+      display: none; 
+      line-height: 1.4;
+    }
+
+    /* Ad Carousel Box */
+    .ad-container { 
+      background: rgba(255, 255, 255, 0.03); 
+      border-radius: 14px; 
+      padding: 14px; 
+      border: 1px solid rgba(255, 255, 255, 0.08); 
+      font-size: 12px; 
+      margin-bottom: 16px;
+      min-height: 68px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+
+    .ad-slide { 
+      display: none; 
+      line-height: 1.4;
+    }
+    
+    .ad-slide.active { 
+      display: block; 
+      animation: fadeIn 0.4s ease-in-out; 
+    }
+
+    .ad-slide strong {
+      color: var(--accent);
+      font-weight: 700;
+      display: block;
+      margin-bottom: 2px;
+      font-size: 13px;
+    }
+
+    /* Portal Ad Callout */
+    .promo-banner {
+      background: rgba(255, 255, 255, 0.02);
+      border: 1px dashed rgba(255, 255, 255, 0.15);
+      border-radius: 12px;
+      padding: 10px;
+      margin-bottom: 16px;
+      font-size: 11px;
+      color: var(--text-muted);
+    }
+
+    .promo-banner strong {
+      color: #fff;
+      display: block;
+      margin-bottom: 2px;
+    }
+
+    /* Support Banner */
+    .contact-card {
+      background: rgba(16, 185, 129, 0.08); 
+      border: 1px solid rgba(16, 185, 129, 0.3); 
+      border-radius: 14px; 
+      padding: 12px; 
+      display: flex; 
+      align-items: center; 
+      justify-content: space-between;
+      text-align: left;
+    }
+
+    .contact-title { font-size: 10px; text-transform: uppercase; font-weight: 800; color: var(--accent); letter-spacing: 1px; }
+    .contact-num { font-size: 12px; font-weight: 700; margin-top: 2px; }
+    .contact-actions { display: flex; gap: 6px; }
+
+    .c-btn {
+      background: #25d366; 
+      color: #fff; 
+      border: none; 
+      padding: 6px 10px; 
+      border-radius: 8px; 
+      font-size: 10px; 
+      font-weight: 700; 
+      text-decoration: none; 
+      display: inline-flex; 
+      align-items: center; 
+      gap: 3px;
+      transition: 0.2s;
+    }
+
+    .c-btn.phone { background: #3b82f6; }
+    .c-btn:hover { opacity: 0.9; }
+
+    @keyframes fadeIn { from { opacity: 0; transform: translateY(3px); } to { opacity: 1; transform: translateY(0); } }
+  </style>
+</head>
+<body>
+
+  <div class="card">
+    <div class="loader-container" id="loader">
+      <div class="loader"></div>
+    </div>
+    
+    <div class="status-text" id="msg">Verifying Payment</div>
+    <p class="sub-text" id="submsg">Checking M-Pesa status. Please complete the prompt on your phone...</p>
+    
+    <div class="ip-info">Device IP: <span id="waitingIp">Loading...</span></div>
+    
+    <div id="errorBox" class="error-box"></div>
+
+    <!-- Cyber Services Rotating Ads -->
+    <div class="ad-container">
+      <div class="ad-slide active">
+        <strong>📋 KRA Returns & PIN Services</strong>
+        Filing, PIN registration & tax compliance checks.
+      </div>
+      <div class="ad-slide">
+        <strong>🏛️ eCitizen Portal Services</strong>
+        Good conduct certificates, business search & driving licenses.
+      </div>
+      <div class="ad-slide">
+        <strong>✈️ Passports & Visas</strong>
+        Application processing & booking appointments fast.
+      </div>
+      <div class="ad-slide">
+        <strong>🖨️ Printing & Document Scanning</strong>
+        High quality document color printouts & scanning.
+      </div>
+      <div class="ad-slide">
+        <strong>🎓 KUCCPS & HELB Applications</strong>
+        Student portal assistance & loan applications.
       </div>
     </div>
-    <script>
-      window.addEventListener('DOMContentLoaded', () => {
-        const storedIp = localStorage.getItem('bhs_client_ip');
-        if (storedIp) {
-          document.getElementById('waitingIp').innerText = storedIp;
-        } else {
-          document.getElementById('waitingIp').innerText = "Not Found";
-        }
-      });
 
-      function speakSuccess() {
-        if ('speechSynthesis' in window) {
-          const msg = new SpeechSynthesisUtterance("Connected. Welcome to B.H.S WiFi");
-          msg.rate = 1;
-          msg.pitch = 1;
-          window.speechSynthesis.speak(msg);
-        }
+    <!-- Portal Business Ad Banner -->
+    <div class="promo-banner">
+      <strong>Want to grow your business?</strong>
+      Advertise your products or services on this WiFi portal. Contact our office!
+    </div>
+
+    <!-- Help & Assistance Bar -->
+    <div class="contact-card">
+      <div>
+        <div class="contact-title">Issue or Delays?</div>
+        <div class="contact-num">0707 759 220</div>
+      </div>
+      <div class="contact-actions">
+        <a href="https://wa.me/254707759220?text=Hi%20BHS%20Cyber,%20I%20need%20help%20with%20my%20WIFI%20payment%20(ID:%20${id})" target="_blank" class="c-btn">WhatsApp</a>
+        <a href="tel:0707759220" class="c-btn phone">Call</a>
+      </div>
+    </div>
+  </div>
+
+  <script>
+    window.addEventListener('DOMContentLoaded', () => {
+      const storedIp = localStorage.getItem('bhs_client_ip');
+      if (storedIp) {
+        document.getElementById('waitingIp').innerText = storedIp;
+      } else {
+        document.getElementById('waitingIp').innerText = "Not Found";
+      }
+    });
+
+    function speakSuccess() {
+      if ('speechSynthesis' in window) {
+        const msg = new SpeechSynthesisUtterance("Connected. Welcome to B.H.S WiFi");
+        msg.rate = 1;
+        msg.pitch = 1;
+        window.speechSynthesis.speak(msg);
+      }
+    }
+
+    // Auto-rotate Ads
+    let cur = 0; 
+    const ads = document.querySelectorAll('.ad-slide');
+    setInterval(() => { 
+      ads[cur].classList.remove('active'); 
+      cur = (cur + 1) % ads.length; 
+      ads[cur].classList.add('active'); 
+    }, 3500);
+
+    let consecutiveErrors = 0;
+    const maxErrors = 5;
+    let pollCount = 0;
+    const maxPolls = 48; // Stop polling after 2 minutes (48 * 2.5s) to save DB reads
+
+    const poll = setInterval(async () => {
+      pollCount++;
+      if (pollCount > maxPolls) {
+        clearInterval(poll);
+        document.getElementById('loader').style.display = "none";
+        document.getElementById('submsg').style.display = "none";
+        const errBox = document.getElementById('errorBox');
+        errBox.innerHTML = "Payment verification timed out.<br>If you completed payment, please call or WhatsApp support below.";
+        errBox.style.display = "block";
+        return;
       }
 
-      let cur = 0; const ads = document.querySelectorAll('.ad-slide');
-      setInterval(() => { ads[cur].classList.remove('active'); cur = (cur+1)%ads.length; ads[cur].classList.add('active'); }, 3000);
+      try {
+        const r = await fetch('/status?id=${id}');
+        if (!r.ok) {
+          throw new Error('Status check failed');
+        }
+        const d = await r.json();
+        consecutiveErrors = 0;
 
-      let consecutiveErrors = 0;
-      const maxErrors = 5;
-      let pollCount = 0;
-      const maxPolls = 48; // Stop polling after 2 minutes (48 * 2.5s) to save DB reads
+        if (d.status === 'PAID' && d.processed === 1) {
+          clearInterval(poll);
+          document.getElementById('msg').innerText = "Connected!";
+          document.getElementById('msg').style.color = "#10b981";
+          document.getElementById('loader').style.display = "none";
+          document.getElementById('submsg').innerText = "Redirecting you to the internet now...";
 
-      const poll = setInterval(async () => {
-        pollCount++;
-        if (pollCount > maxPolls) {
+          speakSuccess();
+
+          setTimeout(() => window.location.href = "http://connectivitycheck.gstatic.com/generate_204", 2500);
+        } else if (d.status === 'FAILED') {
+          clearInterval(poll);
+          document.getElementById('msg').innerText = "Payment Failed";
+          document.getElementById('msg').style.color = "#ef4444";
+          document.getElementById('loader').style.display = "none";
+          document.getElementById('submsg').innerText = "The transaction was cancelled or failed.";
+          
+          const errBox = document.getElementById('errorBox');
+          errBox.innerText = "Transaction failed. Please tap Back on the login page to try again or reach support below.";
+          errBox.style.display = "block";
+        }
+      } catch(e) {
+        consecutiveErrors++;
+        if (consecutiveErrors >= maxErrors) {
           clearInterval(poll);
           document.getElementById('loader').style.display = "none";
           document.getElementById('submsg').style.display = "none";
           const errBox = document.getElementById('errorBox');
-          errBox.innerText = "Payment verification timed out. If you paid, please refresh the page.";
+          errBox.innerText = "Connection lost while checking status. Please check your WiFi connection or reach support below.";
           errBox.style.display = "block";
-          return;
         }
-
-        try {
-          const r = await fetch('/status?id=${id}');
-          if (!r.ok) {
-            throw new Error('Status check failed');
-          }
-          const d = await r.json();
-          consecutiveErrors = 0;
-
-          if (d.status === 'PAID' && d.processed === 1) {
-            clearInterval(poll);
-            document.getElementById('msg').innerText = "Connected!";
-            document.getElementById('msg').style.color = "#2ecc71";
-            document.getElementById('loader').style.display = "none";
-            document.getElementById('submsg').innerText = "Redirecting you now...";
-
-            speakSuccess();
-
-            setTimeout(() => window.location.href = "http://connectivitycheck.gstatic.com/generate_204", 2500);
-          } else if (d.status === 'FAILED') {
-            clearInterval(poll);
-            document.getElementById('msg').innerText = "Payment Failed";
-            document.getElementById('msg').style.color = "#e74c3c";
-            document.getElementById('loader').style.display = "none";
-            document.getElementById('submsg').innerText = "The transaction was cancelled or failed.";
-          }
-        } catch(e) {
-          consecutiveErrors++;
-          if (consecutiveErrors >= maxErrors) {
-            clearInterval(poll);
-            document.getElementById('loader').style.display = "none";
-            document.getElementById('submsg').style.display = "none";
-            const errBox = document.getElementById('errorBox');
-            errBox.innerText = "Connection lost while checking status. Please refresh or reconnect.";
-            errBox.style.display = "block";
-          }
-        }
-      }, 2500);
-    </script>
-  </body></html>`;
+      }
+    }, 2500);
+  </script>
+</body>
+</html>`;
 }
