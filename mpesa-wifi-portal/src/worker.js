@@ -33,10 +33,6 @@ async function generateRhid(token, faskey) {
     .toLowerCase();
 }
 
-// Updated helper function to purge expired active sessions
-async function cleanupExpiredSessions(db) {
-  await db.prepare("DELETE FROM active_payments WHERE session_expiry <= datetime('now')").run();
-}
 
 // Helper to format auth entry with dynamically computed remaining time
 function formatAuthEntry(r) {
@@ -57,6 +53,15 @@ const corsHeaders = {
   "Access-Control-Allow-Methods": "GET, POST, OPTIONS",
   "Access-Control-Allow-Headers": "Content-Type"
 };
+
+// --- HELPER FUNCTIONS ---
+async function cleanupExpiredSessions(db) {
+  try {
+    await db.prepare("DELETE FROM active_payments WHERE session_expiry <= datetime('now')").run();
+  } catch (e) {
+    console.error("Cleanup error:", e);
+  }
+}
 
 export default {
   // Scheduled trigger execution to purge expired records from active_payments
@@ -81,15 +86,11 @@ export default {
         if (tokensToAck.length > 0) {
           const placeholders = tokensToAck.map(() => "?").join(",");
           
-          // 1. Mark historical payments as processed
-          await env.DB.prepare(
-            `UPDATE payments SET processed = 1 WHERE rhid IN (${placeholders})`
-          ).bind(...tokensToAck).run();
-
-          // 2. Remove acknowledged active tokens from the lightweight table
-          await env.DB.prepare(
-            `DELETE FROM active_payments WHERE rhid IN (${placeholders})`
-          ).bind(...tokensToAck).run();
+          // Batch execution to reduce DB round-trips
+          await env.DB.batch([
+            env.DB.prepare(`UPDATE payments SET processed = 1 WHERE rhid IN (${placeholders})`).bind(...tokensToAck),
+            env.DB.prepare(`DELETE FROM active_payments WHERE rhid IN (${placeholders})`).bind(...tokensToAck)
+          ]);
         }
         
         if (ctx && ctx.waitUntil) {
@@ -98,18 +99,17 @@ export default {
         return new Response("ACK_OK\n", { headers: { "Content-Type": "text/plain" } });
       }
 
-      // Query ONLY active, pending clients from active_payments
+      // OPTIMIZED QUERY: Removed LEFT JOIN packages by reading upload_rate/download_rate directly
       const query = `
         SELECT 
           ap.rhid, 
           CAST((julianday(ap.session_expiry) - 2440587.5) * 86400000 AS INTEGER) AS expiry_ms, 
           ap.mac_address, 
           s.client_ip, 
-          pkg.upload_rate, 
-          pkg.download_rate 
+          ap.upload_rate, 
+          ap.download_rate 
         FROM active_payments ap
         LEFT JOIN client_sessions s ON ap.mac_address = s.mac_address
-        LEFT JOIN packages pkg ON ap.amount = pkg.amount
         WHERE ap.processed = 0 
           AND ap.session_expiry > datetime('now') 
           AND ap.gateway_hash = ? 
@@ -117,6 +117,10 @@ export default {
 
       const { results } = await env.DB.prepare(query).bind(gateway).all();
       const activeClients = results || [];
+
+      if (activeClients.length === 0) {
+        return new Response("*\n", { headers: { "Content-Type": "text/plain" } });
+      }
 
       const nowMs = Date.now();
       const validClients = activeClients.filter(r => r.expiry_ms > nowMs);
@@ -195,22 +199,25 @@ export default {
 
       const rhid = await generateRhid(sessRow.token, env.FAS_KEY);
 
-      // 1. Update source-of-truth table
-      await env.DB.prepare(`
-        UPDATE payments 
-        SET processed = 0, session_id = ?, rhid = ? 
-        WHERE id = ?
-      `).bind(sessRow.id, rhid, activePay.id).run();
+      // Execute updates and insertions in a single DB batch
+      await env.DB.batch([
+        env.DB.prepare(`
+          UPDATE payments 
+          SET processed = 0, session_id = ?, rhid = ? 
+          WHERE id = ?
+        `).bind(sessRow.id, rhid, activePay.id),
+        
+        env.DB.prepare("UPDATE client_sessions SET rhid = ? WHERE id = ?").bind(rhid, sessRow.id),
 
-      await env.DB.prepare("UPDATE client_sessions SET rhid = ? WHERE id = ?").bind(rhid, sessRow.id).run();
-
-      // 2. Insert or replace into active_payments for polling
-      await env.DB.prepare(`
-        INSERT INTO active_payments (payment_id, rhid, checkout_id, mac_address, gateway_hash, amount, session_expiry, processed)
-        SELECT id, rhid, checkout_id, mac_address, gateway_hash, amount, session_expiry, 0
-        FROM payments WHERE id = ?
-        ON CONFLICT(payment_id) DO UPDATE SET rhid = excluded.rhid, processed = 0
-      `).bind(activePay.id).run();
+        env.DB.prepare(`
+          INSERT INTO active_payments (payment_id, rhid, checkout_id, mac_address, gateway_hash, amount, upload_rate, download_rate, session_expiry, processed)
+          SELECT p.id, p.rhid, p.checkout_id, p.mac_address, p.gateway_hash, p.amount, pkg.upload_rate, pkg.download_rate, p.session_expiry, 0
+          FROM payments p
+          LEFT JOIN packages pkg ON p.amount = pkg.amount
+          WHERE p.id = ?
+          ON CONFLICT(payment_id) DO UPDATE SET rhid = excluded.rhid, processed = 0
+        `).bind(activePay.id)
+      ]);
 
       return Response.json({ success: true, checkout_id: activePay.checkout_id }, { headers: corsHeaders });
     }
@@ -291,26 +298,28 @@ export default {
           if (sessRow) {
             const rhid = await generateRhid(sessRow.token, env.FAS_KEY);
 
-            await env.DB.prepare("UPDATE client_sessions SET rhid = ? WHERE id = ?")
-              .bind(rhid, sessRow.id).run();
+            // Execute batch updates including denormalized rates insertion into active_payments
+            await env.DB.batch([
+              env.DB.prepare("UPDATE client_sessions SET rhid = ? WHERE id = ?").bind(rhid, sessRow.id),
+              
+              env.DB.prepare(`
+                UPDATE payments 
+                SET status = 'PAID', 
+                    session_id = ?, 
+                    rhid = ?, 
+                    session_expiry = datetime('now', '+' || ? || ' minutes') 
+                WHERE checkout_id = ?
+              `).bind(sessRow.id, rhid, payRow.duration_minutes, result.CheckoutRequestID),
 
-            // 1. Update source of truth (payments)
-            await env.DB.prepare(`
-              UPDATE payments 
-              SET status = 'PAID', 
-                  session_id = ?, 
-                  rhid = ?, 
-                  session_expiry = datetime('now', '+' || ? || ' minutes') 
-              WHERE checkout_id = ?
-            `).bind(sessRow.id, rhid, payRow.duration_minutes, result.CheckoutRequestID).run();
-
-            // 2. Push active session details to active_payments table
-            await env.DB.prepare(`
-              INSERT INTO active_payments (payment_id, rhid, checkout_id, mac_address, gateway_hash, amount, session_expiry, processed)
-              SELECT id, rhid, checkout_id, mac_address, gateway_hash, amount, session_expiry, 0
-              FROM payments WHERE checkout_id = ?
-              ON CONFLICT(payment_id) DO UPDATE SET rhid = excluded.rhid, processed = 0, session_expiry = excluded.session_expiry
-            `).bind(result.CheckoutRequestID).run();
+              env.DB.prepare(`
+                INSERT INTO active_payments (payment_id, rhid, checkout_id, mac_address, gateway_hash, amount, upload_rate, download_rate, session_expiry, processed)
+                SELECT p.id, p.rhid, p.checkout_id, p.mac_address, p.gateway_hash, p.amount, pkg.upload_rate, pkg.download_rate, p.session_expiry, 0
+                FROM payments p
+                LEFT JOIN packages pkg ON p.amount = pkg.amount
+                WHERE p.checkout_id = ?
+                ON CONFLICT(payment_id) DO UPDATE SET rhid = excluded.rhid, processed = 0, session_expiry = excluded.session_expiry
+              `).bind(result.CheckoutRequestID)
+            ]);
           }
         }
       } else {
